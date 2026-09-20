@@ -1,4 +1,12 @@
-"""Small shared helpers: seeding, device choice, logging, timing."""
+"""Small shared helpers: seeding, device choice, logging, timing, optimizer reporting.
+
+The first half is this repository's own tooling (reproducible seeding, device
+resolution, the CSV logger, the stall watchdog, the console-encoding fix).  The
+second half adds the idioms of the reference project
+(``Symmetry-breaking-attention-bias/ecd_symbreak/utils.py``): the ``autocast``
+device-type helper, the ``torch.compile`` graph break, and the two functions that
+report an optimizer's configuration (to JSON, or to Weights & Biases).
+"""
 
 from __future__ import annotations
 
@@ -54,6 +62,32 @@ def resolve_device(requested: str = "auto") -> torch.device:
         print("[warn] device='mps' requested but MPS is unavailable; using CPU")
         return torch.device("cpu")
     return torch.device(requested)
+
+
+def get_device_type() -> str:
+    """Device-type string for ``torch.autocast`` (``"cuda"`` or ``"cpu"``).
+
+    This machine has no GPU, so this returns ``"cpu"`` and every
+    ``torch.autocast`` call takes the CPU (bfloat16) path.
+    """
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def maybe_graph_break() -> None:
+    """Insert a ``torch.compile`` graph break, when dynamo is available.
+
+    This is what the reference project does around a per-step bias resampling:
+    redrawing ``b`` inside a compiled region would either fold a Python-level RNG
+    call into the graph or silently re-trace it, so the break keeps the redraw
+    outside the compiled graph.  Guarded because ``torch._dynamo`` is private and
+    a no-op without ``torch.compile``.
+    """
+    try:
+        import torch._dynamo as _dynamo
+
+        _dynamo.graph_break()
+    except Exception:
+        pass
 
 
 def count_parameters(model: nn.Module, trainable_only: bool = True) -> int:
@@ -121,6 +155,115 @@ def format_seconds(seconds: float) -> str:
         return f"{minutes}m{sec:02d}s"
     hours, minutes = divmod(minutes, 60)
     return f"{hours}h{minutes:02d}m{sec:02d}s"
+
+
+# --------------------------------------------------------------------------- #
+# Optimizer reporting (reference project idiom)
+# --------------------------------------------------------------------------- #
+def _to_serializable(x: Any) -> Any:
+    """Convert a value to a JSON-serializable format."""
+    if isinstance(x, (int, float, str, bool)) or x is None:
+        return x
+    if isinstance(x, (list, tuple)):
+        return [_to_serializable(v) for v in x]
+    if isinstance(x, dict):
+        return {k: _to_serializable(v) for k, v in x.items()}
+    try:
+        if hasattr(x, "item"):
+            return x.item()
+    except Exception:
+        pass
+    try:
+        if torch.is_tensor(x):
+            return (
+                x.item()
+                if x.numel() == 1
+                else f"tensor(shape={tuple(x.shape)}, dtype={x.dtype})"
+            )
+    except Exception:
+        pass
+    return str(x)
+
+
+def serialize_optimizer(opt) -> Dict[str, Any]:
+    """Serialize optimizer state to a JSON-serializable dictionary.
+
+    Args:
+        opt: Optimizer instance.
+
+    Returns:
+        Dictionary with the optimizer class name, its ``defaults`` and one entry
+        per param group (the ``params`` list itself is dropped -- it holds
+        tensors and is not informative).
+    """
+    info: Dict[str, Any] = {
+        "class": opt.__class__.__name__,
+        "defaults": {},
+        "param_groups": [],
+    }
+    d = getattr(opt, "defaults", {})
+    info["defaults"] = {k: _to_serializable(v) for k, v in d.items()}
+    for g in getattr(opt, "param_groups", []):
+        g_copy = {k: _to_serializable(v) for k, v in g.items() if k != "params"}
+        info["param_groups"].append(g_copy)
+    return info
+
+
+def wandb_record_optimizer(
+    run,
+    opt_kind: str,
+    opt_obj,
+    egd_kwargs: Optional[Dict[str, Any]] = None,
+    lr_calibrated: Optional[float] = None,
+) -> None:
+    """Record optimizer configuration to Weights & Biases.
+
+    The reference project calls this optimizer "ECD", so the hyperparameter block
+    it logs is keyed ``"ecd"`` -- **it is the same optimizer this repository calls
+    :class:`~symbreak_transformer.optimizer.EGD`**, published under its original
+    name, and the key is kept identical so run histories stay comparable across
+    the two projects.  The ``optimizer.kind`` field is whatever the caller passes
+    (``"egd"`` here, ``"ecd"`` upstream).
+
+    Args:
+        run: W&B run object (``None`` is a no-op, so training works without W&B).
+        opt_kind: optimizer kind string, e.g. ``"egd"``, ``"adamw"``, ``"sgdm"``.
+        opt_obj: the optimizer instance.
+        egd_kwargs: EGD-specific kwargs, logged under ``"ecd"`` when
+            ``opt_kind`` is ``"egd"``.
+        lr_calibrated: calibrated learning rate, when one was found.
+    """
+    if run is None:
+        return
+    info = serialize_optimizer(opt_obj)
+    payload = {
+        "optimizer": {
+            "kind": opt_kind,
+            "class": info["class"],
+            "defaults": info["defaults"],
+            "param_groups": info["param_groups"],
+        }
+    }
+    if lr_calibrated is not None:
+        payload["optimizer"]["calibrated_lr"] = lr_calibrated
+    run.config.update(payload, allow_val_change=True)
+
+    if opt_kind == "egd" and egd_kwargs is not None:
+        run.config.update(
+            {
+                "ecd": {
+                    "lr": egd_kwargs.get("lr"),
+                    "F0": egd_kwargs.get("F0"),
+                    "eps1": egd_kwargs.get("eps1"),
+                    "eps2": egd_kwargs.get("eps2"),
+                    "nu": egd_kwargs.get("nu"),
+                    "weight_decay": egd_kwargs.get("weight_decay"),
+                    "eta": egd_kwargs.get("eta"),
+                    "consEn": egd_kwargs.get("consEn"),
+                }
+            },
+            allow_val_change=True,
+        )
 
 
 # --------------------------------------------------------------------------- #

@@ -1,12 +1,12 @@
-# Runtime requirements for transformer_sym (CPU-only research repo).
-# Minimum versions match what is installed and verified on this machine:
-# Python 3.13.14, torch 2.13.0+cpu, numpy 2.5.1, PyYAML 6.0.3, tqdm 4.69.1,
+# Runtime requirements for symbreak-transformer (CPU-only research repo).
+# Minimum versions match what is installed and verified on the development
+# machine: Python 3.13.14, torch 2.13.0+cpu, numpy 2.5.1, tqdm 4.69.1,
 # pandas 2.2.3, matplotlib 3.11.1, pytest 9.1.1.
 #
-# There is no GPU and no CUDA on the target box: the torch wheel is the +cpu one.
+# There is no GPU and no CUDA on the target box: the torch wheel is the +cpu one,
+# and every preset in symbreak_transformer/config.py is sized to fit it.
 torch>=2.13.0
 numpy>=2.5.1
-PyYAML>=6.0.3
 tqdm>=4.69.1
 pandas>=2.2.3
 matplotlib>=3.11.1
@@ -14,12 +14,13 @@ pytest>=9.1.1
 
 # optional:
 # The data pipeline does NOT need HuggingFace's `datasets` or `transformers`.
-# data/download.py uses urllib against the hf-mirror.com endpoint directly and
-# parses JSON Lines itself, so neither package is required (and `datasets`
-# would pull in a large dependency tree for no benefit here).
+# symbreak_transformer/data/download.py talks to the configured endpoint with
+# urllib and parses JSON Lines itself, so neither package is required.
 #   datasets     -- NOT required
 #   transformers -- NOT required
-# BLEU is implemented in-tree (transformer_sym/evaluate.py), so `sacrebleu`
-# is NOT required either; install it only if you want to cross-check our
-# scores against the reference implementation.
+# BLEU is implemented in-tree (symbreak_transformer/evaluate.py), so `sacrebleu`
+# is NOT required either; install it only to cross-check the scores.
 #   sacrebleu    -- optional (cross-checking only)
+# Training logs to Weights & Biases when you pass --wandb; without the package
+# installed the flag prints a warning and is otherwise ignored.
+#   wandb        -- optional (only for --wandb)

@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .config import ACTIVATIONS
+from ..config import ACTIVATIONS
 
 __all__ = ["RandomPReLU1d", "FeedForward"]
 

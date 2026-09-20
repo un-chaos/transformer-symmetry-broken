@@ -13,6 +13,7 @@ pytest-cache-files-*/
 
 # Experiment output
 runs/
+wandb/
 *.pt
 *.pth
 

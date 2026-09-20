@@ -1,4 +1,4 @@
-"""Network-free tests for ``transformer_sym.data``.
+"""Network-free tests for ``symbreak_transformer.data``.
 
 Every test here uses either the deterministic synthetic task or files written
 into pytest's ``tmp_path``.  The one HuggingFace test points ``hf_endpoint`` at a
@@ -6,7 +6,8 @@ into pytest's ``tmp_path``.  The one HuggingFace test points ``hf_endpoint`` at 
 without touching the network.  So ``python -m pytest tests/test_data.py -q``
 passes with the cable unplugged.
 
-Covered contract points (INTERFACES.md section 1):
+Covered contract points (PORT_NOTES.md, "Public API required by the lead agent",
+part B):
 
 * synthetic ``copy`` / ``reverse`` / ``sort`` determinism and token ranges,
 * tokenizer special ids and deterministic vocabulary ordering
@@ -15,6 +16,10 @@ Covered contract points (INTERFACES.md section 1):
 * ``collate_batch`` key names, shapes, dtypes and mask polarity (True == PAD),
 * a full ``build_dataloaders`` round trip asserting right-padding with ``pad_id``
   and the exact ``tgt_in`` / ``tgt_out`` one-step shift.
+
+There is no ``ExperimentConfig`` any more: every loader takes a plain
+:class:`~symbreak_transformer.config.DataConfig`, and ``build_dataloaders`` reads
+the batch size / worker count / seed from its own arguments.
 """
 
 from __future__ import annotations
@@ -32,8 +37,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from transformer_sym.config import DataConfig, ExperimentConfig
-from transformer_sym.data import (
+from symbreak_transformer.config import DataConfig
+from symbreak_transformer.data import (
     BOS_ID,
     EOS_ID,
     PAD_ID,
@@ -138,7 +143,7 @@ def write_hf_cache(
 # package surface
 # --------------------------------------------------------------------------- #
 def test_public_api_exports() -> None:
-    import transformer_sym.data as data
+    import symbreak_transformer.data as data
 
     for name in data.__all__:
         assert hasattr(data, name), f"__all__ lists missing name {name!r}"
@@ -449,6 +454,21 @@ def test_dataset_framing_and_clipping() -> None:
         EOS_ID,
     ]
 
+    # max_*_len == 0 falls back to ``default_max_len`` -- the training script
+    # passes its model's ``context_length`` there, so the dataset itself never
+    # reads a model config.
+    defaulted = ParallelTextDataset(
+        [("a b c", "x y z")], src_tok, tgt_tok, default_max_len=3
+    )
+    assert defaulted[0][0] == [src_tok.stoi["a"], src_tok.stoi["b"], EOS_ID]
+    assert defaulted[0][1] == [BOS_ID, tgt_tok.stoi["x"], EOS_ID]
+    # An explicit max_*_len wins over the fallback.
+    explicit = ParallelTextDataset(
+        [("a b c", "x y z")], src_tok, tgt_tok, max_src_len=1, default_max_len=3
+    )
+    assert explicit[0][0] == [EOS_ID]
+    assert explicit[0][1] == [BOS_ID, tgt_tok.stoi["x"], EOS_ID]
+
     src_lens, tgt_lens = dataset.lengths()
     assert src_lens == [len(dataset[i][0]) for i in range(len(dataset))]
     assert tgt_lens == [len(dataset[i][1]) for i in range(len(dataset))]
@@ -517,24 +537,20 @@ def test_collate_batch_keys_shapes_dtypes_and_mask_polarity() -> None:
 
 
 def test_build_dataloaders_roundtrip_on_synthetic(tmp_path: Path) -> None:
-    cfg = ExperimentConfig()
-    cfg.data = make_synthetic_cfg(tmp_path, task="reverse")
-    cfg.model.max_seq_len = 32
-    cfg.train.batch_size = 4
-    cfg.train.num_workers = 0
-    cfg.train.seed = 7
+    cfg = make_synthetic_cfg(tmp_path, task="reverse")
     cfg.validate()
 
-    pairs_by_split = load_all_splits(cfg.data)
+    pairs_by_split = load_all_splits(cfg)
     assert list(pairs_by_split) == ["train", "val", "test"]
-    src_tok, tgt_tok = build_tokenizers(cfg.data, pairs_by_split)
-    loaders = build_dataloaders(cfg, src_tok, tgt_tok)
+    src_tok, tgt_tok = build_tokenizers(cfg, pairs_by_split)
+    loaders = build_dataloaders(cfg, src_tok, tgt_tok, batch_size=4, num_workers=0, seed=7)
 
     assert list(loaders) == ["train", "val", "test"]
-    assert len(loaders["train"].dataset) == cfg.data.synthetic_train_size == 16
+    assert len(loaders["train"].dataset) == cfg.synthetic_train_size == 16
     assert len(loaders["train"]) == 4  # 16 / 4, drop_last=False
     assert len(loaders["val"]) == 2  # 5 pairs -> 4 + 1 (short batch kept)
     assert loaders["train"].batch_size == 4
+    assert loaders["train"].num_workers == 0
 
     batch = next(iter(loaders["val"]))
     assert set(batch) == {
@@ -592,45 +608,43 @@ def test_build_dataloaders_roundtrip_on_synthetic(tmp_path: Path) -> None:
     assert (batch["tgt_in"] != UNK_ID).all()
     assert (batch["tgt_out"] != UNK_ID).all()
 
-    # 5. clipping budget comes from model.max_seq_len when data.max_*_len is 0.
+    # 5. ``data.max_src_len`` / ``data.max_tgt_len`` of 0 disable clipping, so
+    #    each sequence keeps exactly ``synthetic_len`` tokens plus the EOS.  (The
+    #    fallback budget lives on ``ParallelTextDataset.default_max_len``, which
+    #    ``scripts/train.py`` fills in from the model's context_length.)
     widths = {len(loaders[s].dataset[0][0]) for s in loaders}
-    assert max(widths) <= cfg.model.max_seq_len + 1  # +1 for the EOS
+    assert max(widths) <= cfg.synthetic_len + 1  # +1 for the EOS
 
     # 6. train shuffling is seeded => two builds give the same order.
-    other = build_dataloaders(cfg, src_tok, tgt_tok)
+    other = build_dataloaders(cfg, src_tok, tgt_tok, batch_size=4, num_workers=0, seed=7)
     first_repeat = next(iter(other["train"]))
     assert torch.equal(first_repeat["src"], next(iter(loaders["train"]))["src"])
 
 
 def test_build_dataloaders_skips_empty_splits(tmp_path: Path) -> None:
-    cfg = ExperimentConfig()
-    cfg.data = make_synthetic_cfg(tmp_path, task="copy", synthetic_test_size=0)
-    cfg.train.batch_size = 4
+    cfg = make_synthetic_cfg(tmp_path, task="copy", synthetic_test_size=0)
     cfg.validate()
-    pairs = load_all_splits(cfg.data)
-    src_tok, tgt_tok = build_tokenizers(cfg.data, pairs)
+    pairs = load_all_splits(cfg)
+    src_tok, tgt_tok = build_tokenizers(cfg, pairs)
 
-    loaders = build_dataloaders(cfg, src_tok, tgt_tok)
+    loaders = build_dataloaders(cfg, src_tok, tgt_tok, batch_size=4)
     assert "test" not in loaders and set(loaders) == {"train", "val"}
 
-    cfg.data.synthetic_val_size = 0
-    cfg.data.synthetic_train_size = 0
-    pairs = load_all_splits(cfg.data)
+    cfg.synthetic_val_size = 0
+    cfg.synthetic_train_size = 0
+    pairs = load_all_splits(cfg, ("train", "val"))
     with pytest.raises(ValueError, match="no non-empty split"):
         build_dataloaders(cfg, src_tok, tgt_tok, splits=("train", "val"))
 
 
 def test_dataloaders_respect_data_length_overrides(tmp_path: Path) -> None:
-    cfg = ExperimentConfig()
-    cfg.data = make_synthetic_cfg(tmp_path, task="copy", synthetic_len=8)
-    cfg.data.max_src_len = 3
-    cfg.data.max_tgt_len = 4
-    cfg.model.max_seq_len = 32
-    cfg.train.batch_size = 2
+    cfg = make_synthetic_cfg(tmp_path, task="copy", synthetic_len=8)
+    cfg.max_src_len = 3
+    cfg.max_tgt_len = 4
     cfg.validate()
-    pairs = load_all_splits(cfg.data)
-    src_tok, tgt_tok = build_tokenizers(cfg.data, pairs)
-    loaders = build_dataloaders(cfg, src_tok, tgt_tok)
+    pairs = load_all_splits(cfg)
+    src_tok, tgt_tok = build_tokenizers(cfg, pairs)
+    loaders = build_dataloaders(cfg, src_tok, tgt_tok, batch_size=2)
     src_ids, tgt_ids = loaders["val"].dataset[0]
     assert len(src_ids) == 3 and src_ids[-1] == EOS_ID
     assert len(tgt_ids) == 4 and tgt_ids[0] == BOS_ID and tgt_ids[-1] == EOS_ID

@@ -1,7 +1,7 @@
-"""Tests for the ``transformer_sym`` model stack.
+"""Tests for the ``symbreak_transformer`` model stack.
 
-Everything here is deliberately tiny (``d_model=32``, 2+2 layers, ``d_ff=64``,
-``max_seq_len=16``) so the whole file runs in a few seconds on CPU.
+Everything here is deliberately tiny (``n_embd=32``, 2+2 layers, ``d_ff=64``,
+``context_length=16``) so the whole file runs in a few seconds on CPU.
 
 The three tests that matter most -- they fail loudly if the mask polarity or the
 bias wiring is wrong:
@@ -22,14 +22,9 @@ import copy
 import pytest
 import torch
 
-from transformer_sym.bias import AttentionBias, EmbeddingBias
-from transformer_sym.config import (
-    AttentionBiasConfig,
-    BiasConfig,
-    EmbeddingBiasConfig,
-    ModelConfig,
-)
-from transformer_sym.model import Seq2SeqTransformer
+from symbreak_transformer.bias import AttentionBias, EmbeddingBias
+from symbreak_transformer.config import BiasConfig, Seq2SeqConfig, resolve_bias_config
+from symbreak_transformer.model import Seq2SeqTransformer
 
 # --------------------------------------------------------------------------- #
 # Shared tiny setup
@@ -41,61 +36,66 @@ PAD_ID, BOS_ID, EOS_ID = 0, 2, 3
 MAX_SEQ_LEN = 16
 
 
-def make_cfg(**overrides) -> ModelConfig:
+def make_cfg(**overrides) -> Seq2SeqConfig:
     """The tiny model shape used by every test."""
     base = dict(
-        d_model=32,
-        n_heads=4,
-        n_encoder_layers=2,
-        n_decoder_layers=2,
+        n_embd=32,
+        n_head=4,
+        n_encoder_layer=2,
+        n_decoder_layer=2,
         d_ff=64,
         dropout=0.0,
         attention_dropout=0.0,
-        max_seq_len=MAX_SEQ_LEN,
+        context_length=MAX_SEQ_LEN,
         activation="gelu",
         tie_output_embedding=True,
         share_embeddings=False,
     )
     base.update(overrides)
-    return ModelConfig(**base)
+    return Seq2SeqConfig(**base)
 
 
 def make_bias_cfg(
     embed_mode: str = "zero",
     attn: bool = False,
-    attention_mode: str = "gaussian",
+    attn_mode: str = "gaussian",
     embed_resample: str = "fixed",
-    attention_resample: str = "fixed",
+    attn_resample: str = "fixed",
     **attn_fields,
 ) -> BiasConfig:
-    """A :class:`BiasConfig` with explicit switches.
+    """A flat :class:`BiasConfig` with explicit switches.
 
     ``embed_mode="zero"`` is the unbiased default: the embedding bias is an exact
     zero vector and attention biases are absent, so two models built from the same
-    seed must be bit-identical.  ``attn_fields`` are forwarded to
-    :class:`AttentionBiasConfig` (e.g. ``q_enabled=True``, ``learnable=True``).
+    seed must be bit-identical.  ``attn=True`` turns the master switch on and, like
+    the old nested ``AttentionBiasConfig`` defaults, enables ``bQ`` and ``bV``
+    while leaving ``bK`` off.  ``attn_fields`` are the flat attention fields from
+    :class:`BiasConfig` (e.g. ``use_q_bias=True``, ``attn_learnable=True``).
     """
-    attention = AttentionBiasConfig(
-        enabled=attn,
-        mode=attention_mode,
-        resample=attention_resample,
-        **attn_fields,
-    )
-    return BiasConfig(
-        embed=EmbeddingBiasConfig(
-            mode=embed_mode, resample=embed_resample, seed=7
-        ),
-        attention=attention,
+    fields = {
+        "use_q_bias": bool(attn),
+        "use_k_bias": False,
+        "use_v_bias": bool(attn),
+    }
+    fields.update(attn_fields)
+    return resolve_bias_config(
+        None,
+        embed_mode=embed_mode,
+        embed_resample=embed_resample,
+        embed_seed=7,
+        attn_mode=attn_mode,
+        attn_resample=attn_resample,
+        **fields,
     )
 
 
-def make_model(cfg: ModelConfig | None = None, bias_cfg: BiasConfig | None = None,
+def make_model(cfg: Seq2SeqConfig | None = None, bias_cfg: BiasConfig | None = None,
                seed: int = 0) -> Seq2SeqTransformer:
     """Seeded model factory (seed first, so weight init is reproducible)."""
-    if isinstance(cfg, BiasConfig) or isinstance(bias_cfg, ModelConfig):
+    if isinstance(cfg, BiasConfig) or isinstance(bias_cfg, Seq2SeqConfig):
         raise TypeError(
             "make_model(cfg, bias_cfg, seed): got the two configs in the wrong "
-            "order -- pass ModelConfig first, BiasConfig second"
+            "order -- pass Seq2SeqConfig first, BiasConfig second"
         )
     torch.manual_seed(seed)
     return Seq2SeqTransformer(
@@ -307,10 +307,10 @@ def test_causal_mask_is_strictly_upper_triangular():
 
 def test_fully_masked_rows_stay_finite():
     """All-pad keys must not produce NaN: fully masked rows fall back to column 0."""
-    from transformer_sym.attention import MultiHeadAttention
+    from symbreak_transformer.model import MultiHeadAttention
 
     torch.manual_seed(0)
-    attn = MultiHeadAttention(d_model=32, n_heads=4)
+    attn = MultiHeadAttention(d_model=32, n_head=4)
     attn.eval()
     x = torch.randn(2, 3, 32)
     all_pad = torch.ones(2, 3, dtype=torch.bool)  # every key is PAD
@@ -328,10 +328,10 @@ def test_fully_masked_row_is_one_hot_on_column_zero():
     un-blocked *and* its logit is pinned to 0, so the softmax is a one-hot.
     Without that, the row would be a uniform average over all blocked columns.
     """
-    from transformer_sym.attention import MultiHeadAttention
+    from symbreak_transformer.model import MultiHeadAttention
 
     torch.manual_seed(0)
-    attn = MultiHeadAttention(d_model=32, n_heads=4)
+    attn = MultiHeadAttention(d_model=32, n_head=4)
     attn.eval()
     batch, length = 2, 4
     x = torch.randn(batch, length, 32)
@@ -370,10 +370,10 @@ def test_verified_padding_direction():
     """Pin down the polarity: a PAD *key* is ignored, a real key is used."""
     import torch.nn.functional as F
 
-    from transformer_sym.attention import MultiHeadAttention
+    from symbreak_transformer.model import MultiHeadAttention
 
     torch.manual_seed(0)
-    attn = MultiHeadAttention(d_model=8, n_heads=1)
+    attn = MultiHeadAttention(d_model=8, n_head=1)
     attn.eval()
     x = torch.randn(1, 2, 8)
     # Build V manually so the attended values are known.
@@ -404,10 +404,10 @@ def test_verified_padding_direction():
 
 
 def test_float_masks_raise_type_error():
-    from transformer_sym.attention import MultiHeadAttention
+    from symbreak_transformer.model import MultiHeadAttention
 
     torch.manual_seed(0)
-    attn = MultiHeadAttention(d_model=32, n_heads=4)
+    attn = MultiHeadAttention(d_model=32, n_head=4)
     x = torch.randn(2, 3, 32)
     with pytest.raises(TypeError):
         attn(x, x, x, key_padding_mask=torch.zeros(2, 3))
@@ -474,7 +474,7 @@ def test_attention_bias_changes_output():
     unbiased = make_model(make_cfg(), make_bias_cfg("zero", attn=False), seed=321)
     biased = make_model(
         make_cfg(),
-        make_bias_cfg("zero", attn=True, attention_mode="gaussian", q_enabled=True),
+        make_bias_cfg("zero", attn=True, attn_mode="gaussian", use_q_bias=True),
         seed=321,
     )
     unbiased.eval()
@@ -490,7 +490,7 @@ def test_attention_bias_changes_output():
     assert report["encoder.bQ_mode"] == "gaussian"
     assert report["decoder_self.bQ_norm"] > 0.0
     assert report["decoder_cross.bQ_norm"] > 0.0
-    assert report["encoder.bK_mode"] == "zero"  # k_enabled defaults to False
+    assert report["encoder.bK_mode"] == "zero"  # use_k_bias defaults to False
 
     with torch.no_grad():
         a = unbiased(src, tgt_in)["logits"]
@@ -582,7 +582,7 @@ def test_resample_biases_per_step_and_zero():
         "gaussian",
         attn=True,
         embed_resample="per_step",
-        attention_resample="per_step",
+        attn_resample="per_step",
     )
     # Equal vocabularies so the two embeddings can share one bias instance.
     model = Seq2SeqTransformer(
@@ -622,8 +622,8 @@ def test_bias_report_is_finite_floats_and_reports_mode():
     model = make_model(
         make_cfg(),
         make_bias_cfg(
-            "gaussian", attn=True, attention_mode="const", q_enabled=True,
-            v_enabled=True,
+            "gaussian", attn=True, attn_mode="const", use_q_bias=True,
+            use_v_bias=True,
         ),
         seed=13,
     )
@@ -691,7 +691,7 @@ def test_bias_report_csv_columns_are_correct():
     }
 
     biased = make_model(
-        make_cfg(), make_bias_cfg("gaussian", attn=True, q_enabled=True), seed=1
+        make_cfg(), make_bias_cfg("gaussian", attn=True, use_q_bias=True), seed=1
     )
     biased_norms = _csv_bias_norms(biased.bias_report())
     assert biased_norms["embed_b_norm"] == pytest.approx(
@@ -699,14 +699,14 @@ def test_bias_report_csv_columns_are_correct():
     )
     assert biased_norms["bQ_norm"] > 0.0
     assert biased_norms["bV_norm"] > 0.0
-    assert biased_norms["bK_norm"] == 0.0  # k_enabled is off
+    assert biased_norms["bK_norm"] == 0.0  # use_k_bias is off
 
 
 # --------------------------------------------------------------------------- #
 # 7. Gradients
 # --------------------------------------------------------------------------- #
 def test_gradients_flow_to_every_submodule():
-    model = make_model(make_cfg(), make_bias_cfg("gaussian", attn=True, q_enabled=True))
+    model = make_model(make_cfg(), make_bias_cfg("gaussian", attn=True, use_q_bias=True))
     model.train()
     src, tgt_in, labels = batch()
     out = model(src, tgt_in, labels=labels)
@@ -763,12 +763,13 @@ def test_gradients_reach_prelu_and_layernorm():
 
 def test_learnable_attention_bias_gets_gradient():
     cfg = make_cfg()
-    bias_cfg = BiasConfig(
-        embed=EmbeddingBiasConfig(mode="zero"),
-        attention=AttentionBiasConfig(
-            enabled=True, mode="gaussian", q_enabled=True, learnable=True,
-            resample="fixed",
-        ),
+    bias_cfg = resolve_bias_config(
+        None,
+        embed_mode="zero",
+        attn_mode="gaussian",
+        use_q_bias=True,
+        attn_learnable=True,
+        attn_resample="fixed",
     )
     model = make_model(cfg, bias_cfg, seed=17)
     model.train()
@@ -890,11 +891,11 @@ def test_greedy_decode_learns_a_sequence_task():
     converge, so this is not seed-sensitive.
     """
     perm = torch.tensor([7, 9, 11, 13, 15, 17, 19, 21, 4, 5, 6, 8])
-    cfg = make_cfg(dropout=0.0, attention_dropout=0.0, max_seq_len=12)
+    cfg = make_cfg(dropout=0.0, attention_dropout=0.0, context_length=12)
     torch.manual_seed(0)
     model = Seq2SeqTransformer(
         cfg,
-        make_bias_cfg("gaussian", attn=True, q_enabled=True, v_enabled=True),
+        make_bias_cfg("gaussian", attn=True, use_q_bias=True, use_v_bias=True),
         src_vocab_size=SRC_VOCAB,
         tgt_vocab_size=TGT_VOCAB,
         pad_id=PAD_ID,
@@ -932,7 +933,7 @@ def test_greedy_decode_learns_a_sequence_task():
 # 9. Config plumbing
 # --------------------------------------------------------------------------- #
 def test_encoder_decoder_layer_counts_follow_config():
-    model = make_model(make_cfg(n_encoder_layers=3, n_decoder_layers=1))
+    model = make_model(make_cfg(n_encoder_layer=3, n_decoder_layer=1))
     assert len(model.encoder.layers) == 3
     assert len(model.decoder.layers) == 1
 
@@ -946,11 +947,11 @@ def test_encoder_norm_only_for_pre_ln():
 
 def test_fixed_sinusoidal_positions():
     """``learned_positional=False`` is a valid alternative embedding."""
-    from transformer_sym.embedding import TokenPositionalEmbedding
+    from symbreak_transformer.model import TokenPositionalEmbedding
 
     torch.manual_seed(0)
     emb = TokenPositionalEmbedding(
-        vocab_size=10, d_model=8, max_seq_len=6, learned_positional=False
+        vocab_size=10, n_embd=8, context_length=6, learned_positional=False
     )
     out = emb(torch.tensor([[1, 2, 3]]))
     assert out.shape == (1, 3, 8)

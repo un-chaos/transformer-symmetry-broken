@@ -1,7 +1,7 @@
-"""Pytest bootstrap: make the repository root importable as ``transformer_sym``.
+"""Pytest bootstrap: make the repository root importable as ``symbreak_transformer``.
 
 Kept deliberately tiny -- it exists so ``python -m pytest`` works from anywhere
-without installing the package.
+without installing the package, and so tests can import ``scripts.plot_curve``.
 """
 
 import sys

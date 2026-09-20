@@ -28,7 +28,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .bias import AttentionBias
+from ..bias import AttentionBias
 
 __all__ = ["MultiHeadAttention"]
 
@@ -47,15 +47,15 @@ class MultiHeadAttention(nn.Module):
     """Scaled dot-product multi-head attention.
 
     Args:
-        d_model: model width; must be divisible by ``n_heads``.
-        n_heads: number of attention heads.
+        d_model: model width; must be divisible by ``n_head``.
+        n_head: number of attention heads.
         dropout: dropout on the attention probabilities.
-        bias: optional :class:`~transformer_sym.bias.AttentionBias`; when it is
-            active, ``bQ``/``bK``/``bV`` are added to the per-head q/k/v tensors
-            right before the scores are computed (reference behaviour).
+        bias: optional :class:`~symbreak_transformer.bias.AttentionBias`; when it
+            is active, ``bQ``/``bK``/``bV`` are added to the per-head q/k/v
+            tensors right before the scores are computed (reference behaviour).
 
     Attributes:
-        head_dim: ``d_model // n_heads``.
+        head_dim: ``d_model // n_head``.
         q_proj, k_proj, v_proj, out_proj: separate ``nn.Linear`` layers (each
             with its own bias), so no fused ``in_proj_weight`` hides the wiring.
     """
@@ -63,21 +63,21 @@ class MultiHeadAttention(nn.Module):
     def __init__(
         self,
         d_model: int,
-        n_heads: int,
+        n_head: int,
         dropout: float = 0.0,
         bias: Optional[AttentionBias] = None,
     ) -> None:
         super().__init__()
-        if d_model % n_heads != 0:
+        if d_model % n_head != 0:
             raise ValueError(
-                f"d_model ({d_model}) must be divisible by n_heads ({n_heads})"
+                f"d_model ({d_model}) must be divisible by n_head ({n_head})"
             )
         if not 0.0 <= dropout < 1.0:
             raise ValueError(f"dropout must be in [0, 1), got {dropout}")
 
         self.d_model = int(d_model)
-        self.n_heads = int(n_heads)
-        self.head_dim = self.d_model // self.n_heads
+        self.n_head = int(n_head)
+        self.head_dim = self.d_model // self.n_head
         self.dropout_p = float(dropout)
 
         self.q_proj = nn.Linear(self.d_model, self.d_model)
@@ -90,12 +90,12 @@ class MultiHeadAttention(nn.Module):
 
     # ------------------------------------------------------------------ #
     def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
-        """``(B, T, d_model)`` -> ``(B, n_heads, T, head_dim)``."""
+        """``(B, T, d_model)`` -> ``(B, n_head, T, head_dim)``."""
         batch, length, _ = x.shape
-        return x.view(batch, length, self.n_heads, self.head_dim).transpose(1, 2)
+        return x.view(batch, length, self.n_head, self.head_dim).transpose(1, 2)
 
     def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
-        """``(B, n_heads, T, head_dim)`` -> ``(B, T, d_model)``."""
+        """``(B, n_head, T, head_dim)`` -> ``(B, T, d_model)``."""
         batch, _, length, _ = x.shape
         return x.transpose(1, 2).contiguous().view(batch, length, self.d_model)
 
@@ -194,7 +194,7 @@ class MultiHeadAttention(nn.Module):
         v = self._split_heads(self.v_proj(value))
 
         if self.bias is not None and self.bias.active:
-            # bQ / bK / bV enter here, on the (B, n_heads, T, head_dim) tensors.
+            # bQ / bK / bV enter here, on the (B, n_head, T, head_dim) tensors.
             q, k, v = self.bias.apply(q, k, v)
 
         scores = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
@@ -220,7 +220,7 @@ class MultiHeadAttention(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Return the post-softmax attention weights ``(B, n_heads, Tq, S)``.
+        """Return the post-softmax attention weights ``(B, n_head, Tq, S)``.
 
         Exposed for diagnostics and tests: it is the only way to inspect the
         block mask's effect (and the fully-masked-row fallback) directly, since
@@ -240,7 +240,7 @@ class MultiHeadAttention(nn.Module):
 
     def extra_repr(self) -> str:
         return (
-            f"d_model={self.d_model}, n_heads={self.n_heads}, "
+            f"d_model={self.d_model}, n_head={self.n_head}, "
             f"head_dim={self.head_dim}, dropout={self.dropout_p}, "
             f"bias={'none' if self.bias is None else ('active' if self.bias.active else 'inactive')}"
         )

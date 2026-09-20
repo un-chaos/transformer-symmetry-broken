@@ -21,16 +21,16 @@ from typing import Callable, List, Optional
 import torch
 import torch.nn as nn
 
+from ..bias import AttentionBias
+from ..config import Seq2SeqConfig
 from .attention import MultiHeadAttention
-from .bias import AttentionBias
-from .config import ModelConfig
 from .feedforward import FeedForward
 
 __all__ = ["BiasFactory", "EncoderLayer", "Encoder"]
 
 #: Called once per layer; returns the ``AttentionBias`` that layer should use
 #: (or ``None``).  Returning one shared instance reproduces
-#: ``AttentionBiasConfig.share_across_layers``.
+#: ``BiasConfig.share_across_layers``.
 BiasFactory = Callable[[], Optional[AttentionBias]]
 
 
@@ -39,14 +39,14 @@ class EncoderLayer(nn.Module):
 
     Args:
         d_model: model width.
-        n_heads: attention heads.
+        n_head: attention heads.
         d_ff: feed-forward hidden width.
         dropout: dropout used inside the residual branches.
         attention_dropout: dropout inside the attention softmax.
         activation: feed-forward activation (``gelu``/``relu``/``prelu``).
         norm_first: pre-LN when ``True``, post-LN when ``False``.
-        attn_bias: optional :class:`~transformer_sym.bias.AttentionBias` applied
-            to the self-attention q/k/v.
+        attn_bias: optional :class:`~symbreak_transformer.bias.AttentionBias`
+            applied to the self-attention q/k/v.
         prelu_random_init: use :class:`RandomPReLU1d` instead of ``nn.PReLU``.
         prelu_slope_mean: mean of the random PReLU slopes.
         prelu_slope_std: std of the random PReLU slopes.
@@ -55,7 +55,7 @@ class EncoderLayer(nn.Module):
     def __init__(
         self,
         d_model: int,
-        n_heads: int,
+        n_head: int,
         d_ff: int,
         dropout: float = 0.0,
         attention_dropout: float = 0.0,
@@ -69,7 +69,7 @@ class EncoderLayer(nn.Module):
         super().__init__()
         self.norm_first = bool(norm_first)
         self.self_attn = MultiHeadAttention(
-            d_model, n_heads, dropout=attention_dropout, bias=attn_bias
+            d_model, n_head, dropout=attention_dropout, bias=attn_bias
         )
         self.ff = FeedForward(
             d_model,
@@ -123,12 +123,12 @@ class Encoder(nn.Module):
             all read from it.
         bias_factory: called **once per layer** to obtain that layer's
             attention bias.  With ``share_across_layers=True`` the factory
-            returns the same :class:`~transformer_sym.bias.AttentionBias`
+            returns the same :class:`~symbreak_transformer.bias.AttentionBias`
             instance every time, which is exactly why this class must never
             ``copy.deepcopy`` a layer: a deep copy would clone the bias buffers
             and silently break the sharing (the copies would then be resampled
             independently, and ``share_across_layers`` would be a lie).
-        num_layers: defaults to ``cfg.n_encoder_layers``.
+        num_layers: defaults to ``cfg.n_encoder_layer``.
 
     Attributes:
         layers: the ``nn.ModuleList`` of layers.
@@ -138,21 +138,21 @@ class Encoder(nn.Module):
 
     def __init__(
         self,
-        cfg: ModelConfig,
+        cfg: Seq2SeqConfig,
         bias_factory: BiasFactory,
         num_layers: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.cfg = cfg
-        n_layers = int(num_layers if num_layers is not None else cfg.n_encoder_layers)
+        n_layers = int(num_layers if num_layers is not None else cfg.n_encoder_layer)
         if n_layers < 1:
             raise ValueError(f"num_layers must be >= 1, got {n_layers}")
 
         self.layers = nn.ModuleList(
             [
                 EncoderLayer(
-                    d_model=cfg.d_model,
-                    n_heads=cfg.n_heads,
+                    d_model=cfg.n_embd,
+                    n_head=cfg.n_head,
                     d_ff=cfg.d_ff,
                     dropout=cfg.dropout,
                     attention_dropout=cfg.attention_dropout,
@@ -168,7 +168,7 @@ class Encoder(nn.Module):
         )
         # Pre-LN only: the residual stream leaves the stack unnormalised.
         self.encoder_norm: Optional[nn.LayerNorm] = (
-            nn.LayerNorm(cfg.d_model) if cfg.norm_first else None
+            nn.LayerNorm(cfg.n_embd) if cfg.norm_first else None
         )
 
     def forward(

@@ -1,28 +1,36 @@
-"""Evaluation helpers: validation loss, greedy decoding, corpus BLEU, curves.
+"""Evaluation helpers: validation loss, greedy decoding and corpus BLEU.
 
 BLEU is implemented here (no ``sacrebleu`` dependency) so the repo runs on a
 bare ``torch`` + ``numpy`` install.  ``sacrebleu`` is used automatically when it
 happens to be importable, for cross-checking.
+
+Plotting lives in ``scripts/plot_curve.py``, not here: the evaluation helpers are
+imported by the training loop on every run, and a plotting dependency (matplotlib
++ pandas) has no business in that path.
 """
 
 from __future__ import annotations
 
-import csv
 import math
 from collections import Counter
-from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from .data.tokenizer import PAD_ID
+# ``PAD_ID`` lives with the tokenizer (``data/tokenizer.py``: 0/1/2/3 for
+# pad/unk/bos/eos).  The fallback keeps this module importable on its own -- and
+# the pad index is part of the frozen data contract, so the two cannot drift.
+try:  # pragma: no cover - the import always succeeds in a full checkout
+    from .data.tokenizer import PAD_ID
+except ImportError:  # pragma: no cover
+    PAD_ID = 0
 
 __all__ = [
     "evaluate_loss",
     "corpus_bleu",
+    "cross_check_with_sacrebleu",
     "greedy_translate",
     "evaluate_bleu",
-    "plot_curve",
 ]
 
 
@@ -41,7 +49,8 @@ def evaluate_loss(
 
     Args:
         model: the seq2seq transformer (must accept ``src, tgt_in, ...``).
-        loader: a ``DataLoader`` built by :func:`transformer_sym.data.dataset.build_dataloaders`.
+        loader: a ``DataLoader`` built by
+            :func:`symbreak_transformer.data.dataset.build_dataloaders`.
         device: torch device.
         pad_id: ignored label index.
         max_batches: 0 evaluates the whole loader, otherwise the first N batches.
@@ -295,64 +304,3 @@ def evaluate_bleu(
     if show_samples:
         result["samples"] = samples
     return result
-
-
-# --------------------------------------------------------------------------- #
-# Training curves
-# --------------------------------------------------------------------------- #
-def plot_curve(csv_path, out_path=None, title: str = "") -> Optional[Path]:
-    """Plot train/val loss (and bias norms when logged) from a run CSV.
-
-    Returns the written PNG path, or ``None`` when matplotlib/pandas are missing.
-    """
-    csv_path = Path(csv_path)
-    out_path = Path(out_path) if out_path else csv_path.with_name("training_curve.png")
-    try:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import pandas as pd
-    except Exception as exc:  # pragma: no cover - optional dependency
-        print(f"[plot] skipped ({type(exc).__name__}: {exc})")
-        return None
-    if not csv_path.exists():
-        print(f"[plot] skipped, no CSV at {csv_path}")
-        return None
-
-    frame = pd.read_csv(csv_path)
-    if frame.empty:
-        print("[plot] skipped, empty log")
-        return None
-
-    has_val = "val_loss" in frame.columns and frame["val_loss"].notna().any()
-    bias_cols = [
-        c for c in ("embed_b_norm", "bQ_norm", "bK_norm", "bV_norm") if c in frame.columns
-    ]
-    panels = 1 + (1 if bias_cols else 0)
-    fig, axes = plt.subplots(1, panels, figsize=(6.5 * panels, 4.2), squeeze=False)
-    ax = axes[0][0]
-    ax.plot(frame["step"], frame["train_loss"], label="train", linewidth=1.2)
-    if has_val:
-        ax.plot(frame["step"], frame["val_loss"], label="val", linewidth=1.4)
-    ax.set_xlabel("step")
-    ax.set_ylabel("cross-entropy")
-    ax.set_title(title or csv_path.parent.name)
-    ax.grid(alpha=0.3)
-    ax.legend()
-
-    if bias_cols:
-        ax2 = axes[0][1]
-        for col in bias_cols:
-            ax2.plot(frame["step"], frame[col], label=col, linewidth=1.2)
-        ax2.set_xlabel("step")
-        ax2.set_ylabel("||bias||")
-        ax2.set_title("symmetry-breaking bias norms")
-        ax2.grid(alpha=0.3)
-        ax2.legend()
-
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print(f"[plot] wrote {out_path}")
-    return out_path

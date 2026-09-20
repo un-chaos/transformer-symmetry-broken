@@ -12,18 +12,20 @@ Embedding-bias placement (the decision this module implements, and the one
 :meth:`Seq2SeqTransformer.bias_report` states):
 
 * ``b`` is applied to the **source** embedding, and
-* to the **target** embedding as well **whenever ``cfg.bias.embed.mode != "zero"``**
-  (a ``zero``-mode bias is an exact zero offset, so attaching it to the target
-  would only add dead state to the checkpoint).
+* to the **target** embedding as well **whenever
+  ``bias_cfg.embed_mode != "zero"``** (a ``zero``-mode bias is an exact zero
+  offset, so attaching it to the target would only add dead state to the
+  checkpoint).
 * When ``src_vocab_size == tgt_vocab_size`` the two embeddings share **one and
-  the same** :class:`~transformer_sym.bias.EmbeddingBias` instance -- the same
-  ``b`` is added on both sides, matching the "one bias for the model" intent.
-  When the vocabularies differ, each side gets its own instance built from the
-  same config (seeds offset by one so the draws are independent but reproducible).
+  the same** :class:`~symbreak_transformer.bias.EmbeddingBias` instance -- the
+  same ``b`` is added on both sides, matching the "one bias for the model"
+  intent.  When the vocabularies differ, each side gets its own instance built
+  from the same flat ``BiasConfig`` fields (seeds offset by one so the draws are
+  independent but reproducible).
 
-Attention-bias placement: three independent factories
-(encoder self-attention, decoder self-attention, decoder cross-attention) are
-built from :class:`~transformer_sym.config.AttentionBiasConfig`; see
+Attention-bias placement: three independent factories (encoder self-attention,
+decoder self-attention, decoder cross-attention) are built from the flat
+:class:`~symbreak_transformer.config.BiasConfig`; see
 :meth:`Seq2SeqTransformer._attention_bias_factory`.
 """
 
@@ -35,8 +37,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .bias import AttentionBias, EmbeddingBias
-from .config import BiasConfig, ModelConfig
+from ..bias import AttentionBias, EmbeddingBias
+from ..config import BiasConfig, Seq2SeqConfig
 from .decoder import Decoder
 from .embedding import TokenPositionalEmbedding
 from .encoder import BiasFactory, Encoder
@@ -51,9 +53,13 @@ class Seq2SeqTransformer(nn.Module):
     """A small encoder-decoder Transformer with two families of symmetry breaks.
 
     Args:
-        cfg: the model shape (:class:`~transformer_sym.config.ModelConfig`).
-        bias_cfg: the bias switches (:class:`~transformer_sym.config.BiasConfig`).
-        src_vocab_size: defaults to ``cfg.vocab_size_src``; a config value of
+        cfg: the model shape (:class:`~symbreak_transformer.config.Seq2SeqConfig`).
+        bias_cfg: the bias switches
+            (:class:`~symbreak_transformer.config.BiasConfig`); the flat
+            ``embed_*`` fields drive the embedding bias and the
+            ``use_q_bias``/``use_k_bias``/``use_v_bias`` plus ``attn_*`` fields
+            drive the per-head attention biases.
+        src_vocab_size: defaults to ``cfg.src_vocab_size``; a config value of
             ``0`` means "not resolved yet" and raises, because the tokenizer owns
             the real vocabulary size.
         tgt_vocab_size: same, for the target side.
@@ -62,16 +68,21 @@ class Seq2SeqTransformer(nn.Module):
         eos_id: token that stops a row in :meth:`greedy_decode`.
 
     Attributes:
-        src_embed, tgt_embed: :class:`~transformer_sym.embedding.TokenPositionalEmbedding`
+        cfg: the :class:`~symbreak_transformer.config.Seq2SeqConfig` this model
+            was built from.
+        bias_cfg: the :class:`~symbreak_transformer.config.BiasConfig` this model
+            was built from.
+        src_embed, tgt_embed:
+            :class:`~symbreak_transformer.model.embedding.TokenPositionalEmbedding`
             modules carrying the ``b`` offset.
         encoder, decoder: the two stacks.
-        output_proj: ``d_model -> tgt_vocab``; ``bias=False`` so its weight can be
+        output_proj: ``n_embd -> tgt_vocab``; ``bias=False`` so its weight can be
             tied to the target embedding matrix when ``cfg.tie_output_embedding``.
     """
 
     def __init__(
         self,
-        cfg: ModelConfig,
+        cfg: Seq2SeqConfig,
         bias_cfg: BiasConfig,
         src_vocab_size: Optional[int] = None,
         tgt_vocab_size: Optional[int] = None,
@@ -84,14 +95,14 @@ class Seq2SeqTransformer(nn.Module):
         self.bias_cfg = bias_cfg
 
         src_vocab = self._resolve_vocab_size(
-            src_vocab_size if src_vocab_size is not None else cfg.vocab_size_src,
+            src_vocab_size if src_vocab_size is not None else cfg.src_vocab_size,
             "src_vocab_size",
-            "cfg.vocab_size_src",
+            "cfg.src_vocab_size",
         )
         tgt_vocab = self._resolve_vocab_size(
-            tgt_vocab_size if tgt_vocab_size is not None else cfg.vocab_size_tgt,
+            tgt_vocab_size if tgt_vocab_size is not None else cfg.tgt_vocab_size,
             "tgt_vocab_size",
-            "cfg.vocab_size_tgt",
+            "cfg.tgt_vocab_size",
         )
 
         if cfg.share_embeddings and src_vocab != tgt_vocab:
@@ -107,30 +118,39 @@ class Seq2SeqTransformer(nn.Module):
         self.eos_id = int(eos_id)
 
         # ---------------- embeddings + the embedding bias b ---------------- #
-        embed_cfg = bias_cfg.embed
-        bias_on_target = embed_cfg.mode != "zero"
-        if embed_cfg.mode != "zero" and src_vocab == tgt_vocab:
+        # ``EmbeddingBias`` takes the flat ``embed_*`` fields as explicit kwargs
+        # (there is no ``EmbeddingBiasConfig`` object any more).
+        embed_kwargs = dict(
+            n_embd=cfg.n_embd,
+            mode=bias_cfg.embed_mode,
+            mean=bias_cfg.embed_mean,
+            std=bias_cfg.embed_std,
+            const_value=bias_cfg.embed_const_value,
+            resample=bias_cfg.embed_resample,
+            learnable=bias_cfg.embed_learnable,
+            seed=bias_cfg.embed_seed,
+        )
+        if bias_cfg.embed_mode != "zero" and src_vocab == tgt_vocab:
             # One shared b for both sides: the same offset in the same space.
-            src_bias: Optional[EmbeddingBias] = EmbeddingBias(cfg.d_model, embed_cfg)
+            src_bias: Optional[EmbeddingBias] = EmbeddingBias(**embed_kwargs)
             tgt_bias: Optional[EmbeddingBias] = src_bias
-        elif embed_cfg.mode != "zero":
-            # Separate vocabularies: two instances from one config, seeds offset so
-            # the draws differ yet stay reproducible.
-            import copy as _copy  # local: only used to derive a sibling config
-
-            src_bias = EmbeddingBias(cfg.d_model, embed_cfg)
-            sibling = _copy.copy(embed_cfg)
-            sibling.seed = int(embed_cfg.seed) + 1
-            tgt_bias = EmbeddingBias(cfg.d_model, sibling)
+        elif bias_cfg.embed_mode != "zero":
+            # Separate vocabularies: two instances from one flat config, seeds
+            # offset so the draws differ yet stay reproducible.  The caller's
+            # ``bias_cfg`` is never mutated.
+            src_bias = EmbeddingBias(**embed_kwargs)
+            tgt_bias = EmbeddingBias(
+                **{**embed_kwargs, "seed": int(bias_cfg.embed_seed) + 1}
+            )
         else:
-            src_bias = EmbeddingBias(cfg.d_model, embed_cfg)
+            src_bias = EmbeddingBias(**embed_kwargs)
             tgt_bias = None
 
         if cfg.share_embeddings:
             shared = TokenPositionalEmbedding(
                 src_vocab,
-                cfg.d_model,
-                cfg.max_seq_len,
+                cfg.n_embd,
+                cfg.context_length,
                 dropout=cfg.dropout,
                 scale=cfg.scale_embedding,
                 bias=src_bias,
@@ -140,16 +160,16 @@ class Seq2SeqTransformer(nn.Module):
         else:
             self.src_embed = TokenPositionalEmbedding(
                 src_vocab,
-                cfg.d_model,
-                cfg.max_seq_len,
+                cfg.n_embd,
+                cfg.context_length,
                 dropout=cfg.dropout,
                 scale=cfg.scale_embedding,
                 bias=src_bias,
             )
             self.tgt_embed = TokenPositionalEmbedding(
                 tgt_vocab,
-                cfg.d_model,
-                cfg.max_seq_len,
+                cfg.n_embd,
+                cfg.context_length,
                 dropout=cfg.dropout,
                 scale=cfg.scale_embedding,
                 bias=tgt_bias,
@@ -165,10 +185,10 @@ class Seq2SeqTransformer(nn.Module):
 
         # ---------------- output projection / tying ---------------- #
         if cfg.tie_output_embedding:
-            self.output_proj = nn.Linear(cfg.d_model, tgt_vocab, bias=False)
+            self.output_proj = nn.Linear(cfg.n_embd, tgt_vocab, bias=False)
             self.output_proj.weight = self.tgt_embed.wte.weight  # type: ignore[union-attr]
         else:
-            self.output_proj = nn.Linear(cfg.d_model, tgt_vocab)
+            self.output_proj = nn.Linear(cfg.n_embd, tgt_vocab)
 
         self._scale_residual_outputs()
         self._init_all_weights()
@@ -180,6 +200,8 @@ class Seq2SeqTransformer(nn.Module):
         n_params = sum(p.numel() for p in self.parameters())
         n_emb = self.tgt_embed.wte.weight.numel() + self.src_embed.wte.weight.numel()
         self._n_non_embedding_params = n_params - n_emb
+        # One 0-D bool tensor per forward pass ("did this batch contain padding?"),
+        # i.e. always stackable -- see :meth:`_make_pad_probe`.
         self._probe_pads: List[torch.Tensor] = []
         self.register_forward_pre_hook(self._make_pad_probe())
 
@@ -201,40 +223,47 @@ class Seq2SeqTransformer(nn.Module):
         """Build the factory that decides the bias object for one attention site.
 
         ``site`` is one of ``"encoder"``, ``"decoder_self"``, ``"decoder_cross"``;
-        it maps to ``AttentionBiasConfig.apply_encoder`` /
-        ``apply_decoder_self`` / ``apply_decoder_cross``.
+        it maps to ``BiasConfig.apply_encoder`` / ``apply_decoder_self`` /
+        ``apply_decoder_cross``.
 
-        * ``bias_cfg.enabled`` false, or the site's switch off -> ``lambda: None``.
+        * ``bias_cfg.attention_enabled`` false, or the site's switch off ->
+          ``lambda: None``.
         * ``share_across_layers`` true -> one instance created here and returned
           by every call to the factory.
         * ``share_across_layers`` false -> a fresh ``AttentionBias`` per call, so
           every layer has independent buffers.
         """
         bias_cfg = self.bias_cfg
-        attn = bias_cfg.attention
         switch = {
-            "encoder": attn.apply_encoder,
-            "decoder_self": attn.apply_decoder_self,
-            "decoder_cross": attn.apply_decoder_cross,
+            "encoder": bias_cfg.apply_encoder,
+            "decoder_self": bias_cfg.apply_decoder_self,
+            "decoder_cross": bias_cfg.apply_decoder_cross,
         }[site]
 
-        if not attn.enabled or not switch:
+        if not bias_cfg.attention_enabled or not switch:
             return lambda: None
 
-        head_dim = self.cfg.d_model // self.cfg.n_heads
-        if attn.share_across_layers:
-            shared = AttentionBias(self.cfg.n_heads, head_dim, attn)
+        head_dim = self.cfg.n_embd // self.cfg.n_head
+        if bias_cfg.share_across_layers:
+            shared = AttentionBias(self.cfg.n_head, head_dim, bias_cfg)
             self.add_module(f"attn_bias_{site}", shared)
             return lambda: shared
-        return lambda: AttentionBias(self.cfg.n_heads, head_dim, attn)
+        return lambda: AttentionBias(self.cfg.n_head, head_dim, bias_cfg)
 
     def _make_pad_probe(self):
-        """A forward pre-hook that records the padded positions of (src, tgt_in).
+        """A forward pre-hook that records *whether* a batch contained padding.
 
-        Used by :meth:`bias_report` to decide whether a shared attention bias is
-        actually reachable from a padded position: if the model is *asked* to
-        process padding, then "padding invariance" below is no longer a property
-        of the whole attention map.
+        One 0-D bool tensor is appended per forward pass -- ``True`` when that
+        batch's ``(src, tgt_in)`` was handed at least one ``pad_id`` position --
+        and only the last 16 are kept.  Used by :meth:`bias_report` (via
+        :meth:`_padding_invariance_holds`) to answer the plain question "was any
+        recent batch actually given padded positions?".
+
+        Reducing to a scalar at collection time is deliberate: batch sizes and
+        padded lengths vary between passes (the last short batch of an epoch, an
+        eval batch, a different split), so storing the padded positions themselves
+        would hand :meth:`_padding_invariance_holds` a list of variable-length
+        tensors that cannot be stacked.
         """
 
         def hook(_module, inputs):
@@ -245,11 +274,11 @@ class Seq2SeqTransformer(nn.Module):
                 return
             if self.pad_id < 0:
                 return
-            probe = torch.cat(
-                [(src.detach() == self.pad_id).reshape(-1),
-                 (tgt_in.detach() == self.pad_id).reshape(-1)]
+            has_pad = bool(
+                (src.detach() == self.pad_id).any()
+                or (tgt_in.detach() == self.pad_id).any()
             )
-            self._probe_pads.append(probe)
+            self._probe_pads.append(torch.tensor(has_pad))
             if len(self._probe_pads) > 16:
                 del self._probe_pads[0]
 
@@ -261,9 +290,10 @@ class Seq2SeqTransformer(nn.Module):
     def _init_all_weights(self) -> None:
         """Apply :meth:`_init_weights` to every submodule.
 
-        Deliberately *not* ``self.apply(...)``: :class:`~transformer_sym.bias.AttentionBias`
-        defines an ``apply(q, k, v)`` method with a different meaning, which would
-        shadow ``nn.Module.apply`` on that submodule and blow up the traversal.
+        Deliberately *not* ``self.apply(...)``:
+        :class:`~symbreak_transformer.bias.AttentionBias` defines an
+        ``apply(q, k, v)`` method with a different meaning, which would shadow
+        ``nn.Module.apply`` on that submodule and blow up the traversal.
         """
         for module in self.modules():
             self._init_weights(module)
@@ -272,8 +302,8 @@ class Seq2SeqTransformer(nn.Module):
         """nanoGPT-style initialisation, applied with ``self.apply``.
 
         * ``nn.Linear`` -> ``N(0, init_std^2)``, additionally multiplied by
-          ``(2 * (n_encoder_layers + n_decoder_layers)) ** -0.5`` when the module
-          is a residual-output projection (``out_proj``, ``ff.c_proj``,
+          ``(2 * (n_encoder_layer + n_decoder_layer)) ** -0.5`` when the module is
+          a residual-output projection (``out_proj``, ``ff.c_proj``,
           ``output_proj``) and ``cfg.scaled_residual_init`` is set.
         * ``nn.Embedding`` -> ``N(0, init_std^2)``.  The fixed sinusoidal table is
           a non-persistent buffer, not an ``nn.Embedding``, so it is untouched.
@@ -294,7 +324,7 @@ class Seq2SeqTransformer(nn.Module):
             if self.cfg.scaled_residual_init and getattr(
                 module, "_residual_out", False
             ):
-                scale = (2 * (self.cfg.n_encoder_layers + self.cfg.n_decoder_layers)) ** -0.5
+                scale = (2 * (self.cfg.n_encoder_layer + self.cfg.n_decoder_layer)) ** -0.5
                 module.weight.data.mul_(scale)
         elif isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=std)
@@ -321,7 +351,7 @@ class Seq2SeqTransformer(nn.Module):
         src: torch.Tensor,
         src_padding_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Embed + encode ``src``; returns the memory ``(B, S, d_model)``.
+        """Embed + encode ``src``; returns the memory ``(B, S, n_embd)``.
 
         Args:
             src: ``(B, S)`` long source ids.
@@ -342,7 +372,7 @@ class Seq2SeqTransformer(nn.Module):
 
         Args:
             tgt_in: ``(B, T)`` long decoder inputs (starts with BOS).
-            memory: ``(B, S, d_model)`` encoder output.
+            memory: ``(B, S, n_embd)`` encoder output.
             tgt_padding_mask: bool ``(B, T)``, **``True`` means PAD**.
             memory_padding_mask: bool ``(B, S)``, **``True`` means PAD**.
 
@@ -430,7 +460,7 @@ class Seq2SeqTransformer(nn.Module):
             src: ``(B, S)`` source ids.
             src_padding_mask: bool ``(B, S)``, ``True`` = PAD.
             max_len: maximum *total* length including the leading BOS; ``0`` means
-                ``cfg.max_seq_len``.
+                ``cfg.context_length``.
             bos_id: start token; defaults to the model's ``bos_id``.
             eos_id: stop token; defaults to the model's ``eos_id``.
 
@@ -442,7 +472,7 @@ class Seq2SeqTransformer(nn.Module):
         self.eval()
         bos = self.bos_id if bos_id is None else int(bos_id)
         eos = self.eos_id if eos_id is None else int(eos_id)
-        limit = int(max_len) if max_len and max_len > 0 else int(self.cfg.max_seq_len)
+        limit = int(max_len) if max_len and max_len > 0 else int(self.cfg.context_length)
 
         memory = self.encode(src, src_padding_mask)
         batch = int(src.shape[0])
@@ -519,14 +549,14 @@ class Seq2SeqTransformer(nn.Module):
         * ``embed.placed_on`` -- human-readable statement of the placement
           decision, i.e. whether ``b`` sits on the source embedding, on both
           embeddings, and whether the two share one instance.  With
-          ``mode="zero"`` the target bias is not attached at all, so this reads
-          ``"source only (target bias skipped because mode='zero')"`` and
+          ``embed_mode="zero"`` the target bias is not attached at all, so this
+          reads ``"source only (target bias skipped because mode='zero')"`` and
           ``embed.on_target == "no"``.
-        * ``padding.attention_bias_invariant`` -- ``"yes"`` unless the last
-          forward pass was handed padded positions that an attention bias can
-          reach (see :meth:`_padding_invariance_holds`).  Deliberately *not*
-          named ``embed.*``: ``train.py::_bias_norms`` runs ``float()`` over
-          every report value and would otherwise read this string as a norm.
+        * ``padding.attention_bias_invariant`` -- ``"yes"`` unless one of the
+          recent forward passes was handed padded positions that an attention
+          bias can reach (see :meth:`_padding_invariance_holds`).  Deliberately
+          *not* named ``embed.*``: ``train.py::_bias_norms`` runs ``float()``
+          over every report value and would otherwise read this string as a norm.
         * ``<site>.bQ_norm`` / ``bK_norm`` / ``bV_norm`` and
           ``<site>.bQ_mode`` / ``bK_mode`` / ``bV_mode`` per attention site
           (``encoder`` / ``decoder_self`` / ``decoder_cross``, plus ``_2``,
@@ -541,7 +571,7 @@ class Seq2SeqTransformer(nn.Module):
         # object.  Testing only ``len({id(...)}) == 1`` is wrong, because the
         # ``if m.bias is not None`` filter drops the target's ``None`` and leaves
         # a single id -- which would claim a shared bias while the bias sits on
-        # the source only (the ``mode="zero"`` case).
+        # the source only (the ``embed_mode="zero"`` case).
         src_bias_obj = self.src_embed.bias
         tgt_bias_obj = self.tgt_embed.bias
         shared_embed = (
@@ -588,7 +618,7 @@ class Seq2SeqTransformer(nn.Module):
             report[f"{key}.enabled"] = float(bias.enabled)
         if not counts:
             report["attention.enabled"] = 0.0
-            report["attention.mode"] = str(self.bias_cfg.attention.mode)
+            report["attention.mode"] = str(self.bias_cfg.attn_mode)
         return report
 
     def _site_name(self, bias: AttentionBias) -> str:
@@ -609,16 +639,22 @@ class Seq2SeqTransformer(nn.Module):
         return site
 
     def _padding_invariance_holds(self) -> bool:
-        """Whether the attention biases respect padding in the last batch seen."""
+        """Whether the recent batches were all free of padded positions.
+
+        ``True`` when the model has no attention bias, when nothing has been
+        recorded yet, or when none of the last 16 recorded forward passes was
+        handed a ``pad_id`` position.  ``False`` as soon as one of them was: the
+        bias then sits on positions the padding mask does not remove.
+        """
         if not self._probe_pads or not self.attention_biases():
             return True
-        return not bool(torch.stack(self._probe_pads).any())
+        return not any(bool(probe) for probe in self._probe_pads)
 
     # ------------------------------------------------------------------ #
     def extra_repr(self) -> str:
         return (
             f"src_vocab={self.src_vocab_size}, tgt_vocab={self.tgt_vocab_size}, "
-            f"d_model={self.cfg.d_model}, enc={len(self.encoder.layers)}, "
-            f"dec={len(self.decoder.layers)}, heads={self.cfg.n_heads}, "
+            f"n_embd={self.cfg.n_embd}, enc={len(self.encoder.layers)}, "
+            f"dec={len(self.decoder.layers)}, heads={self.cfg.n_head}, "
             f"pad_id={self.pad_id}, tie_output={self.cfg.tie_output_embedding}"
         )

@@ -1,10 +1,15 @@
-"""Tests for ``transformer_sym.optimizer``: ``EGD``, the helpers and the builder.
+"""Tests for ``symbreak_transformer.optimizer``: ``EGD``, the helpers, the builder.
 
 Everything here is deliberately tiny -- at most a few dozen steps on CPU with a
 handful of scalars -- so the whole file runs in a couple of seconds.  The tests
 cover the ported reference behaviour, the two deliberate fixes described in
-``INTERFACES.md`` section 2, and the save/restore round trip that makes
-``train.py --resume`` faithful.
+PORT_NOTES.md section "Preserved fixes" (1 and 2), and the save/restore round
+trip that makes ``train.py --resume`` faithful.
+
+The old ``TrainConfig``/``EGDConfig``/``AdamWConfig`` dataclasses are gone:
+``EGD`` is now constructed directly from explicit hyper-parameters, and
+``build_optimizer(model, kind, egd_kwargs=..., adamw_kwargs=..., sgdm_kwargs=...)``
+takes one plain kwargs dict per kind.
 """
 
 from __future__ import annotations
@@ -20,8 +25,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from transformer_sym.config import TrainConfig
-from transformer_sym.optimizer import EGD, build_optimizer, optimizer_requires_closure
+from symbreak_transformer.optimizer import EGD, build_optimizer, optimizer_requires_closure
 
 # The quadratic 0.5 * ||w - target||^2 at the default starting point below.
 QUADRATIC_INITIAL_LOSS = 0.5 * (4.0 + 9.0 + 1.0 + 0.25)  # == 7.125
@@ -234,6 +238,20 @@ def test_optimizer_requires_closure():
     assert optimizer_requires_closure("EGD") is True
     assert optimizer_requires_closure("adamw") is False
     assert optimizer_requires_closure("sgd") is False
+    assert optimizer_requires_closure("sgdm") is False
+
+
+def test_egd_defaults_are_the_tuned_ones():
+    """The tuned defaults live in ``EGD.__init__`` -- no ``EGDConfig`` any more."""
+    w = torch.nn.Parameter(torch.zeros(3))
+    opt = EGD([w])
+    assert opt.lr == 0.1
+    assert opt.F0 is None
+    assert opt.eta == 100.0
+    assert opt.nu == 0.0
+    assert opt.auto_F0_margin == 1.0
+    assert opt.dim == 0                     # filled in at the first step
+    assert opt._initialized is False
 
 
 def test_build_optimizer_selects_the_optimizer_and_drops_frozen_params():
@@ -244,31 +262,60 @@ def test_build_optimizer_selects_the_optimizer_and_drops_frozen_params():
         p.requires_grad_(False)
     expected = {id(p) for p in model.parameters() if p.requires_grad}
 
-    cfg = TrainConfig()
-    assert cfg.optimizer == "egd"
-
-    egd = build_optimizer(model, cfg)
+    # --- egd (the tuned default kind) ------------------------------------- #
+    egd_kwargs = {"lr": 0.1, "eta": 100.0, "F0": None, "nu": 0.0}
+    egd = build_optimizer(model, "egd", egd_kwargs=egd_kwargs)
     assert isinstance(egd, EGD)
     assert {id(p) for p in egd.param_groups[0]["params"]} == expected
     assert all(p.requires_grad for p in egd.param_groups[0]["params"])
-    assert egd.eta == cfg.egd.eta
-    assert egd.F0 == cfg.egd.F0
-    assert egd.nu == cfg.egd.nu
-    assert egd.lr == cfg.egd.lr                      # not yet rescaled
+    assert egd.eta == egd_kwargs["eta"]
+    assert egd.F0 == egd_kwargs["F0"]
+    assert egd.nu == egd_kwargs["nu"]
+    assert egd.lr == egd_kwargs["lr"]                # not yet rescaled
     assert egd.dim == 0                              # initialised at the first step
 
-    cfg.optimizer = "adamw"
-    adam = build_optimizer(model, cfg)
+    # ... and the same values are what ``build_optimizer`` uses by default.
+    default_egd = build_optimizer(model, "egd")
+    assert isinstance(default_egd, EGD)
+    assert default_egd.lr == 0.1 and default_egd.F0 is None
+    assert default_egd.eta == 100.0 and default_egd.nu == 0.0
+    assert {id(p) for p in default_egd.param_groups[0]["params"]} == expected
+
+    # --- adamw ------------------------------------------------------------ #
+    adamw_kwargs = {"lr": 3e-4, "betas": [0.9, 0.98], "eps": 1e-8, "weight_decay": 0.01}
+    adam = build_optimizer(model, "adamw", adamw_kwargs=adamw_kwargs)
     assert isinstance(adam, torch.optim.AdamW)
     assert {id(p) for p in adam.param_groups[0]["params"]} == expected
-    assert adam.defaults["lr"] == pytest.approx(cfg.adamw.lr)
-    assert tuple(adam.defaults["betas"]) == tuple(cfg.adamw.betas)
-    assert adam.defaults["eps"] == pytest.approx(cfg.adamw.eps)
-    assert adam.defaults["weight_decay"] == pytest.approx(cfg.adamw.weight_decay)
+    assert adam.defaults["lr"] == pytest.approx(adamw_kwargs["lr"])
+    assert tuple(adam.defaults["betas"]) == tuple(adamw_kwargs["betas"])
+    assert adam.defaults["eps"] == pytest.approx(adamw_kwargs["eps"])
+    assert adam.defaults["weight_decay"] == pytest.approx(adamw_kwargs["weight_decay"])
 
-    cfg.optimizer = "sgd"
+    # The kind's own defaults are the ones documented in ``optimizer.py``.
+    default_adam = build_optimizer(model, "adamw")
+    assert default_adam.defaults["lr"] == pytest.approx(1e-3)
+    assert tuple(default_adam.defaults["betas"]) == (0.9, 0.95)
+    assert default_adam.defaults["weight_decay"] == pytest.approx(0.1)
+
+    # --- sgdm ------------------------------------------------------------- #
+    sgdm_kwargs = {"lr": 0.03, "momentum": 0.95, "nesterov": True}
+    sgdm = build_optimizer(model, "sgdm", sgdm_kwargs=sgdm_kwargs)
+    assert isinstance(sgdm, torch.optim.SGD)
+    assert {id(p) for p in sgdm.param_groups[0]["params"]} == expected
+    assert sgdm.defaults["lr"] == pytest.approx(sgdm_kwargs["lr"])
+    assert sgdm.defaults["momentum"] == pytest.approx(sgdm_kwargs["momentum"])
+    assert sgdm.defaults["nesterov"] is True
+
+    default_sgdm = build_optimizer(model, "sgdm")
+    assert isinstance(default_sgdm, torch.optim.SGD)
+    assert default_sgdm.defaults["lr"] == pytest.approx(0.03)
+
+    # --- kind selection --------------------------------------------------- #
+    assert isinstance(build_optimizer(model, "AdamW"), torch.optim.AdamW)
+    with pytest.raises(ValueError, match="optimizer"):   # was a TrainConfig kind
+        build_optimizer(model, "sgd")
     with pytest.raises(ValueError, match="optimizer"):
-        build_optimizer(model, cfg)
+        build_optimizer(model, "lamb")
 
 
 def test_parameters_without_grad_are_skipped_safely():
@@ -447,12 +494,23 @@ def test_resume_continues_the_exact_trajectory():
     state_resumed = resumed.state_dict()
     state_reference = opt_ref.state_dict()
     assert set(state_resumed["egd"]) == set(state_reference["egd"])
+    # ``_restored_egd_state`` is load bookkeeping, not dynamics: it records that
+    # *this* optimizer was handed a checkpoint, so a resumed run and an
+    # uninterrupted one legitimately disagree there (see EGD.load_state_dict).
+    # Every other scalar -- and the momenta and the RNG stream below -- must still
+    # match exactly.
+    load_bookkeeping = {"_restored_egd_state"}
     for key, value in state_resumed["egd"].items():
+        if key in load_bookkeeping:
+            continue
         expected = state_reference["egd"][key]
         if isinstance(value, torch.Tensor) or isinstance(expected, torch.Tensor):
             assert torch.equal(value, expected), key
         else:
             assert value == expected, key
+    if "_restored_egd_state" in state_resumed["egd"]:
+        assert state_resumed["egd"]["_restored_egd_state"] is True
+        assert state_reference["egd"]["_restored_egd_state"] is False
     for src, dst in zip(
         opt_ref.param_groups[0]["params"], resumed.param_groups[0]["params"]
     ):

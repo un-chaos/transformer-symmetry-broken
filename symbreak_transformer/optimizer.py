@@ -1,8 +1,10 @@
-"""EGD -- energy-conserving descent, plus the AdamW baseline and a builder.
+"""EGD -- energy-conserving descent, plus the AdamW / SGD baselines and a builder.
 
 ``EGD`` is a faithful port of ``ECD_q1_scaled`` from the reference project
-(``Symmetry-breaking-attention-bias-main/ecd_symbreak/optimizer.py``), with the
-two deliberate fixes required by ``INTERFACES.md`` section 2:
+(``Symmetry-breaking-attention-bias/ecd_symbreak/optimizer.py``), published there
+under the name **ECD** ("energy conserving descent").  This repository calls it
+``EGD`` and keeps the algorithm verbatim, with the deliberate fixes recorded in
+``PORT_NOTES.md`` "Preserved fixes" 1 and 2:
 
 1. **Dimension double-counting.**  The reference accumulates
    ``self.dim += q.numel()`` inside ``if self.iteration == 0:`` while
@@ -24,6 +26,11 @@ below the smallest reachable loss, otherwise every update is skipped.  The
 momenta are renormalised every step (energy conservation) and optionally kicked
 by Gaussian noise of amplitude ``nu``.
 
+The optimizer hyperparameters are explicit function arguments (the old
+``TrainConfig``/``EGDConfig``/``AdamWConfig`` dataclasses are gone), so they come
+straight from the command line; :func:`build_optimizer` takes them as plain
+``kwargs`` dicts.
+
 Notes:
     * ``step`` is decorated with ``@torch.no_grad()`` and calls the closure
       inside ``with torch.enable_grad():``, so the closure is responsible for
@@ -40,13 +47,10 @@ from __future__ import annotations
 
 import math
 import warnings
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, Optional
 
 import torch
 from torch.optim.optimizer import Optimizer
-
-if TYPE_CHECKING:  # pragma: no cover - imported for type hints only
-    from .config import TrainConfig
 
 __all__ = ["EGD", "optimizer_requires_closure", "build_optimizer"]
 
@@ -54,6 +58,8 @@ __all__ = ["EGD", "optimizer_requires_closure", "build_optimizer"]
 #: quantities the reference keeps on the optimizer instance and *not* in the
 #: per-parameter ``state``, so without them a resumed run would silently restart
 #: the dynamics (dimension, momentum normalisation, energy offset, RNG stream).
+#: ``_restored_egd_state`` is the backing flag of the public
+#: :attr:`EGD.restored_egd_state` property, so it travels with the rest.
 _EGD_STATE_KEYS: tuple[str, ...] = (
     "eta",
     "auto_F0_margin",
@@ -75,6 +81,7 @@ _EGD_STATE_KEYS: tuple[str, ...] = (
     "skipped_updates",
     "last_loss",
     "_initialized",
+    "_restored_egd_state",
 )
 
 
@@ -83,12 +90,14 @@ class EGD(Optimizer):
 
     Args:
         params: iterable of ``torch.nn.Parameter`` (or param groups) to optimise.
-        lr: learning rate; internally rescaled to ``lr / sqrt(eta)``.
+        lr: learning rate; internally rescaled to ``lr / sqrt(eta)``.  The default
+            ``0.1`` is the value tuned for this repository's small seq2seq runs.
         eta: concentration parameter controlling how sharply the dynamics
             concentrates around low loss.
         F0: loss offset; must stay *below* the smallest reachable loss or every
-            update is skipped.  ``F0=None`` resolves it at the first step to
-            ``Finit - auto_F0_margin``.
+            update is skipped.  ``F0=None`` (the default) resolves it at the first
+            step to ``Finit - auto_F0_margin``.  The reference's fixed ``-1`` is
+            wrong for a cross-entropy loss that starts around ``log(vocab)``.
         auto_F0_margin: how far below the initial loss an automatic ``F0`` sits.
         nu: amplitude of the Gaussian "bounce" added to the momenta each step
             (internally rescaled by ``1 / sqrt(dim)``); ``0`` disables the noise.
@@ -126,9 +135,9 @@ class EGD(Optimizer):
     def __init__(
         self,
         params: Iterable[torch.Tensor],
-        lr: float = 1.0,
+        lr: float = 0.1,
         eta: float = 100.0,
-        F0: Optional[float] = 1.0,
+        F0: Optional[float] = None,
         auto_F0_margin: float = 1.0,
         nu: float = 0.0,
         eps1: float = 1e-10,
@@ -440,9 +449,10 @@ class EGD(Optimizer):
 
         The standard ``torch.optim`` structure (``state``, including every
         parameter's ``momenta``, and ``param_groups``) is returned untouched.
-        ``"egd"`` adds the scalars the reference keeps on the instance and the
-        state of the dedicated noise generator, so that a run can be resumed
-        exactly where it stopped.  Every value is a plain float/bool/``None`` or a
+        ``"egd"`` adds the 21 scalars the reference keeps on the instance (plus the
+        backing flag of :attr:`restored_egd_state`) and the state of the dedicated
+        noise generator, so that a run can be resumed exactly where it stopped.
+        Every value is a plain float/bool/``None`` or a
         ``torch.ByteTensor``, so the dict stays ``torch.save``/``torch.load``
         compatible (also with the default ``weights_only=True``).
 
@@ -466,6 +476,9 @@ class EGD(Optimizer):
         rescaled* values of the saved run, ``_initialized`` becomes ``True`` (so
         the initialisation block -- and therefore the rescaling -- cannot run a
         second time), and the noise generator resumes the saved RNG stream.
+        Because ``_restored_egd_state`` is part of the payload,
+        :attr:`restored_egd_state` stays ``True`` across a further
+        save/load round trip.
 
         A checkpoint without ``"egd"`` (an older EGD run or an AdamW-style dict)
         is still accepted: the base class restores the parameters and momenta, a
@@ -502,6 +515,12 @@ class EGD(Optimizer):
             if key in extra:
                 setattr(self, key, extra[key])
 
+        # The flag travels in the payload (it is the 21st scalar), but it is
+        # re-asserted here: *this* optimizer has just been handed a genuine EGD
+        # checkpoint, which is exactly what the property reports -- regardless of
+        # whether the saving run had itself been resumed earlier.
+        self._restored_egd_state = True
+
         generator_state = extra.get("generator_state")
         if generator_state is not None:
             if self.generator is None:
@@ -532,7 +551,7 @@ def optimizer_requires_closure(name: str) -> bool:
     """Whether the optimizer called ``name`` must be stepped with a closure.
 
     Args:
-        name: optimizer name, e.g. ``"egd"`` or ``"adamw"``.
+        name: optimizer kind, e.g. ``"egd"`` or ``"adamw"``.
 
     Returns:
         ``True`` for ``"egd"`` (its dynamics needs the loss *and* the
@@ -541,22 +560,39 @@ def optimizer_requires_closure(name: str) -> bool:
     return str(name).strip().lower() == "egd"
 
 
-def build_optimizer(model: torch.nn.Module, cfg: "TrainConfig") -> Optimizer:
-    """Build the optimizer selected by ``cfg.optimizer``.
+def build_optimizer(
+    model: torch.nn.Module,
+    kind: str,
+    egd_kwargs: Optional[Dict[str, Any]] = None,
+    adamw_kwargs: Optional[Dict[str, Any]] = None,
+    sgdm_kwargs: Optional[Dict[str, Any]] = None,
+) -> Optimizer:
+    """Build the optimizer named by ``kind`` over the model's trainable parameters.
+
+    Mirrors the reference project's ``build_optimizer(model, kind, ...)``
+    dispatcher: the caller (``scripts/train.py``) passes the parsed CLI values as
+    a plain ``kwargs`` dict per kind, so there is no optimizer config dataclass
+    any more.
 
     Only parameters with ``requires_grad=True`` are handed to the optimizer, so
     frozen parts of the model are never touched.
 
     Args:
         model: the model whose parameters are optimised.
-        cfg: a ``TrainConfig`` (``cfg.optimizer``, ``cfg.egd``, ``cfg.adamw``).
+        kind: ``"egd"``, ``"adamw"`` or ``"sgdm"`` (case-insensitive).
+        egd_kwargs: arguments for :class:`EGD`; defaults to ``lr=0.1, F0=None``
+            (tuned for this repository's runs).
+        adamw_kwargs: arguments for ``torch.optim.AdamW``; defaults to
+            ``lr=1e-3, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1``.
+        sgdm_kwargs: arguments for ``torch.optim.SGD``; defaults to
+            ``lr=0.03, momentum=0.95, nesterov=True``.
 
     Returns:
-        An :class:`EGD` for ``"egd"`` or a ``torch.optim.AdamW`` for ``"adamw"``.
+        An :class:`EGD`, a ``torch.optim.AdamW`` or a ``torch.optim.SGD``.
 
     Raises:
-        ValueError: for an unknown ``cfg.optimizer`` or a model without
-            trainable parameters.
+        ValueError: for an unknown ``kind`` or a model without trainable
+            parameters.
     """
     params = [p for p in model.parameters() if p.requires_grad]
     if not params:
@@ -564,31 +600,24 @@ def build_optimizer(model: torch.nn.Module, cfg: "TrainConfig") -> Optimizer:
             "build_optimizer: the model has no parameters with requires_grad=True"
         )
 
-    name = str(cfg.optimizer).strip().lower()
+    name = str(kind).strip().lower()
     if name == "egd":
-        e = cfg.egd
-        return EGD(
-            params,
-            lr=e.lr,
-            eta=e.eta,
-            F0=e.F0,
-            auto_F0_margin=e.auto_F0_margin,
-            nu=e.nu,
-            eps1=e.eps1,
-            eps2=e.eps2,
-            weight_decay=e.weight_decay,
-            consEn=e.consEn,
-            seed=e.seed,
-        )
+        kwargs: Dict[str, Any] = {"lr": 0.1, "F0": None}
+        kwargs.update(egd_kwargs or {})
+        return EGD(params, **kwargs)
     if name == "adamw":
-        a = cfg.adamw
-        return torch.optim.AdamW(
-            params,
-            lr=a.lr,
-            betas=tuple(a.betas),
-            eps=a.eps,
-            weight_decay=a.weight_decay,
-        )
+        kwargs = {
+            "lr": 1e-3,
+            "betas": (0.9, 0.95),
+            "eps": 1e-8,
+            "weight_decay": 0.1,
+        }
+        kwargs.update(adamw_kwargs or {})
+        return torch.optim.AdamW(params, **kwargs)
+    if name == "sgdm":
+        kwargs = {"lr": 0.03, "momentum": 0.95, "nesterov": True}
+        kwargs.update(sgdm_kwargs or {})
+        return torch.optim.SGD(params, **kwargs)
     raise ValueError(
-        f"unknown optimizer {cfg.optimizer!r}; expected 'egd' or 'adamw'"
+        f"unknown optimizer kind {kind!r}; expected 'egd', 'adamw' or 'sgdm'"
     )
