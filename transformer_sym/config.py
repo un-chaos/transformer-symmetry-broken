@@ -8,6 +8,21 @@ Everything the user is expected to tune lives here:
 * the optimizer (``egd`` = energy-conserving descent, or an ``adamw`` baseline)
 * the data source (HuggingFace mirror, synthetic, or local files)
 
+Two ways in, both defined in this file:
+
+1. **Named presets** (the reference project's style) -- pick from
+   :data:`MODEL_PRESETS`, :data:`DATA_PRESETS` and :data:`BIAS_PRESETS`::
+
+       cfg = make_config(model="small", bias="b-gaussian", data="multi30k")
+
+   or from the command line::
+
+       python main.py --model small --bias b-gaussian --data multi30k --set train.egd.lr=0.05
+
+2. **YAML files** -- a whole experiment in one file, see ``configs/``::
+
+       cfg = load_config("configs/small_multi30k.yaml")
+
 The config is intentionally explicit: unknown keys raise an error rather than
 being silently ignored, so a typo in a YAML file cannot silently change an
 experiment.
@@ -15,6 +30,7 @@ experiment.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -383,7 +399,9 @@ class ExperimentConfig:
             raise ValueError(
                 f"data.tokenizer must be one of {TOKENIZER_MODES}, got {d.tokenizer!r}"
             )
-        if d.source == "synthetic" and d.synthetic_task not in SYNTHETIC_TASKS:
+        if d.synthetic_task not in SYNTHETIC_TASKS:
+            # Checked regardless of ``source``: an invalid value is a typo either
+            # way, and failing fast beats discovering it after switching source.
             raise ValueError(
                 f"data.synthetic_task must be one of {SYNTHETIC_TASKS}, "
                 f"got {d.synthetic_task!r}"
@@ -461,6 +479,218 @@ class ExperimentConfig:
 
 # Alias: ``Config`` is the root object.
 Config = ExperimentConfig
+
+
+# --------------------------------------------------------------------------- #
+# Named presets
+# --------------------------------------------------------------------------- #
+# The reference project defines its presets as a plain ``name -> dataclass``
+# dict at the bottom of its config module.  Same idea here, but split into three
+# orthogonal tables (model shape / data source / bias setting) plus a factory,
+# so the three can be varied independently instead of needing a preset for every
+# combination:
+#
+#     cfg = make_config(model="small", bias="b-gaussian", data="multi30k")
+#
+# Every table is read-only in spirit: ``make_config`` deep-copies whatever it
+# takes, so mutating the returned config never corrupts a preset.
+
+#: Encoder-decoder shapes. Names are descriptive; run ``--list-models`` to print
+#: the exact parameter count of each one (it depends on the vocabulary size).
+MODEL_PRESETS: Dict[str, ModelConfig] = {
+    "smoke": ModelConfig(
+        d_model=64, n_heads=4, n_encoder_layers=2, n_decoder_layers=2,
+        d_ff=128, max_seq_len=16, dropout=0.1,
+    ),
+    "tiny": ModelConfig(
+        d_model=128, n_heads=4, n_encoder_layers=2, n_decoder_layers=2,
+        d_ff=256, max_seq_len=32, dropout=0.1,
+    ),
+    "small": ModelConfig(
+        d_model=256, n_heads=8, n_encoder_layers=3, n_decoder_layers=3,
+        d_ff=1024, max_seq_len=64, dropout=0.1,
+    ),
+    "base": ModelConfig(
+        d_model=384, n_heads=8, n_encoder_layers=4, n_decoder_layers=4,
+        d_ff=1536, max_seq_len=128, dropout=0.1,
+    ),
+    "large": ModelConfig(
+        d_model=512, n_heads=8, n_encoder_layers=6, n_decoder_layers=6,
+        d_ff=2048, max_seq_len=128, dropout=0.1,
+    ),
+    "xl": ModelConfig(
+        d_model=768, n_heads=12, n_encoder_layers=12, n_decoder_layers=12,
+        d_ff=3072, max_seq_len=256, dropout=0.1,
+    ),
+}
+
+#: Where the parallel text comes from.
+DATA_PRESETS: Dict[str, DataConfig] = {
+    # Full Multi30k de->en through the HuggingFace mirror.
+    "multi30k": DataConfig(),
+    # The same, capped: the cheap preset the README starts from.
+    "multi30k-tiny": DataConfig(
+        max_train_samples=8000, max_val_samples=1000, max_vocab=12000
+    ),
+    # Offline toy tasks -- no network at all.
+    "synthetic-copy": DataConfig(source="synthetic", synthetic_task="copy"),
+    "synthetic-reverse": DataConfig(source="synthetic", synthetic_task="reverse"),
+    "synthetic-sort": DataConfig(source="synthetic", synthetic_task="sort"),
+}
+
+#: The symmetry-breaking settings -- the actual point of the experiments.
+BIAS_PRESETS: Dict[str, BiasConfig] = {
+    # Control: b = 0 and no attention bias, so O(d_model) is preserved exactly.
+    "symmetric": BiasConfig(),
+    # Non-zero fixed b: breaks the embedding rotation symmetry once, at init.
+    "b-gaussian": BiasConfig(
+        embed=EmbeddingBiasConfig(mode="gaussian", mean=0.0, std=0.02, resample="fixed")
+    ),
+    # The same breaking, redrawn on every optimizer step.
+    "b-gaussian-per-step": BiasConfig(
+        embed=EmbeddingBiasConfig(mode="gaussian", mean=0.0, std=0.02, resample="per_step")
+    ),
+    # Isotropic (rank-one) direction instead of a random one.
+    "b-const": BiasConfig(
+        embed=EmbeddingBiasConfig(mode="const", const_value=1.0, resample="fixed")
+    ),
+    # b as a trained nn.Parameter rather than a fixed buffer.
+    "b-learnable": BiasConfig(
+        embed=EmbeddingBiasConfig(mode="gaussian", std=0.02, learnable=True, resample="fixed")
+    ),
+    # Reference-style per-head biases. bK stays off: a constant shift partly
+    # cancels in the softmax normalisation.
+    "attn-bQ": BiasConfig(
+        attention=AttentionBiasConfig(
+            enabled=True, mode="gaussian", q_enabled=True, k_enabled=False, v_enabled=False
+        )
+    ),
+    "attn-bQbV": BiasConfig(
+        attention=AttentionBiasConfig(
+            enabled=True, mode="gaussian", q_enabled=True, k_enabled=False, v_enabled=True
+        )
+    ),
+    "attn-learnable": BiasConfig(
+        attention=AttentionBiasConfig(
+            enabled=True, mode="gaussian", q_enabled=True, k_enabled=False,
+            v_enabled=True, learnable=True, resample="fixed",
+        )
+    ),
+}
+
+
+def get_model_preset(name: str) -> ModelConfig:
+    """Return a fresh copy of a model preset (mutating it is safe)."""
+    if name not in MODEL_PRESETS:
+        raise KeyError(
+            f"unknown model preset {name!r}. Available: {sorted(MODEL_PRESETS)}"
+        )
+    return copy.deepcopy(MODEL_PRESETS[name])
+
+
+def get_data_preset(name: str) -> DataConfig:
+    """Return a fresh copy of a data preset."""
+    if name not in DATA_PRESETS:
+        raise KeyError(
+            f"unknown data preset {name!r}. Available: {sorted(DATA_PRESETS)}"
+        )
+    return copy.deepcopy(DATA_PRESETS[name])
+
+
+def get_bias_preset(name: str) -> BiasConfig:
+    """Return a fresh copy of a bias preset."""
+    if name not in BIAS_PRESETS:
+        raise KeyError(
+            f"unknown bias preset {name!r}. Available: {sorted(BIAS_PRESETS)}"
+        )
+    return copy.deepcopy(BIAS_PRESETS[name])
+
+
+def make_config(
+    model: Union[str, ModelConfig] = "small",
+    bias: Union[str, BiasConfig] = "symmetric",
+    data: Union[str, DataConfig] = "multi30k",
+    optimizer: str = "egd",
+    overrides: Optional[Sequence[str]] = None,
+) -> ExperimentConfig:
+    """Build a validated config from named presets -- the reference-style way in.
+
+    Args:
+        model: a key of :data:`MODEL_PRESETS`, or a ``ModelConfig`` to use as-is.
+        bias: a key of :data:`BIAS_PRESETS`, or a ``BiasConfig``.
+        data: a key of :data:`DATA_PRESETS`, or a ``DataConfig``.
+        optimizer: ``"egd"`` or ``"adamw"``.
+        overrides: optional ``dotted.path=value`` strings applied last, exactly
+            as on the command line (``--set``).
+
+    Returns:
+        A validated :class:`ExperimentConfig`.
+
+    Example:
+        >>> cfg = make_config("tiny", "b-gaussian", "synthetic-copy")
+        >>> cfg.bias.embed.mode
+        'gaussian'
+    """
+    if isinstance(model, str):
+        model = get_model_preset(model)
+    else:
+        model = copy.deepcopy(model)
+    if isinstance(bias, str):
+        bias = get_bias_preset(bias)
+    else:
+        bias = copy.deepcopy(bias)
+    if isinstance(data, str):
+        data = get_data_preset(data)
+    else:
+        data = copy.deepcopy(data)
+
+    cfg = ExperimentConfig(
+        model=model,
+        bias=bias,
+        data=data,
+        train=TrainConfig(optimizer=optimizer),
+    )
+    if overrides:
+        apply_overrides(cfg, overrides)
+    return cfg.validate()
+
+
+def preset_table() -> str:
+    """Readable listing of every preset name, for ``--list-models`` etc."""
+    lines = ["model presets (shape; exact parameter count needs a vocabulary):"]
+    for name, m in MODEL_PRESETS.items():
+        lines.append(
+            f"  {name:<9} d_model={m.d_model:<4} heads={m.n_heads:<3} "
+            f"enc/dec={m.n_encoder_layers}/{m.n_decoder_layers} "
+            f"d_ff={m.d_ff:<5} max_seq_len={m.max_seq_len}"
+        )
+    lines.append("")
+    lines.append("data presets:")
+    for name, d in DATA_PRESETS.items():
+        detail = (
+            f"hf repo={d.hf_repo} max_train_samples={d.max_train_samples}"
+            if d.source == "hf"
+            else f"synthetic task={d.synthetic_task}"
+        )
+        lines.append(f"  {name:<18} source={d.source:<9} {detail}")
+    lines.append("")
+    lines.append("bias presets (the symmetry-breaking switch):")
+    for name, b in BIAS_PRESETS.items():
+        attn = b.attention
+        if not attn.enabled or attn.mode == "zero":
+            attn_desc = "attn off"
+        else:
+            sectors = "".join(
+                s
+                for s, on in (("Q", attn.q_enabled), ("K", attn.k_enabled), ("V", attn.v_enabled))
+                if on
+            )
+            attn_desc = f"attn b{sectors} {attn.mode}" + (" learnable" if attn.learnable else "")
+        lines.append(
+            f"  {name:<18} embed b: {b.embed.mode:<8} resample={b.embed.resample:<8} "
+            f"learnable={str(b.embed.learnable):<5} | {attn_desc}"
+        )
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #

@@ -6,10 +6,11 @@ A small, readable **encoder-decoder Transformer** built to study one question:
 > of the embedding by adding a fixed bias `b`?
 
 Every structure lives in its own file (encoder, decoder, attention, embeddings,
-feed-forward, the optimizer, the data pipeline), everything is driven from a
-single YAML config, and one main program (`main.py`) ties it together. The
-optimizer is an **energy-conserving descent** method (EGD), with AdamW available
-as a baseline for comparison.
+feed-forward, the optimizer, the data pipeline), one main program (`main.py`)
+ties it together, and an experiment is described either by **named presets in
+`transformer_sym/config.py`** or by a **YAML file**. The optimizer is an
+**energy-conserving descent** method (EGD), with AdamW available as a baseline
+for comparison.
 
 This runs **CPU-only** — it is deliberately sized so that a full experiment
 finishes in minutes, not hours.
@@ -94,7 +95,7 @@ One concept per file:
 ```
 main.py                        # single entry point: train / eval / inspect data
 transformer_sym/
-  config.py                    # typed config objects + YAML load/save + validation
+  config.py                    # dataclasses + named presets (MODEL/DATA/BIAS) + YAML load/save
   bias.py                      # the embedding bias b  and  the per-head bQ/bK/bV
   embedding.py                 # token + positional embedding (this is where x+b happens)
   attention.py                 # hand-written multi-head attention (self & cross)
@@ -122,24 +123,40 @@ tests/                         # pytest suite
 # 1. install (CPU wheels are enough; there is no GPU dependency anywhere)
 pip install -r requirements.txt
 
-# 2. list the presets
-python main.py --list-configs
+# 2. see what is available: Python presets with exact parameter counts
+python main.py --list-models
+python main.py --list-configs        # and the whole-experiment YAML files
 
-# 3. end-to-end smoke test: synthetic copy/reverse task, ~30 steps, well under a minute
-python main.py --config configs/smoke_synthetic.yaml
+# 3. end-to-end smoke test: synthetic task, no network. The step cap keeps it
+#    to well under a minute; drop --set train.max_steps to run the full schedule
+#    (train.max_steps: 0 means epochs x steps_per_epoch).
+python main.py --model smoke --bias symmetric --data synthetic-reverse \
+    --set train.max_steps=60
 
 # 4. the real thing: German -> English on Multi30k
+python main.py --model small --bias symmetric --data multi30k-tiny --bleu
+```
+
+An experiment is three independent choices -- model shape, data source, bias
+setting -- plus overrides. From the named presets in `config.py`:
+
+```bash
+python main.py --model small --bias b-gaussian --data multi30k-tiny
+```
+
+or from a whole-experiment YAML file:
+
+```bash
 python main.py --config configs/small_multi30k.yaml --bleu
 ```
 
-Every knob can be overridden from the command line (values are parsed as YAML,
-so `null`, `true` and `[0.9, 0.98]` all work):
+Every knob can be overridden either way (values are parsed as YAML, so `null`,
+`true` and `[0.9, 0.98]` all work):
 
 ```bash
-python main.py --config configs/small_multi30k.yaml \
-    --set bias.embed.mode=gaussian \
+python main.py --model small --bias b-gaussian --data multi30k-tiny \
     --set bias.embed.std=0.05 \
-    --set train.egd.lr=0.5 \
+    --set train.egd.lr=0.05 \
     --set train.batch_size=32
 ```
 
@@ -333,6 +350,70 @@ changing your experiment.
 
 ## 7. Presets
 
+Presets live in **two** places, and you can use either.
+
+### 7a. Named presets in `config.py` (the quick way)
+
+Following the companion project's style, `transformer_sym/config.py` ends with
+three plain `name -> dataclass` tables that you can read and edit directly:
+
+| table | entries |
+|---|---|
+| `MODEL_PRESETS` | `smoke`, `tiny`, `small`, `base`, `large`, `xl` |
+| `DATA_PRESETS` | `multi30k`, `multi30k-tiny`, `synthetic-copy`, `synthetic-reverse`, `synthetic-sort` |
+| `BIAS_PRESETS` | `symmetric`, `b-gaussian`, `b-gaussian-per-step`, `b-const`, `b-learnable`, `attn-bQ`, `attn-bQbV`, `attn-learnable` |
+
+List them, with the **exact** parameter count of every model size:
+
+```bash
+python main.py --list-models
+python main.py --list-models --vocab 30000     # for a different vocabulary
+```
+
+Compose an experiment from one entry of each table, and override anything on top:
+
+```bash
+python main.py --model small --bias b-gaussian --data multi30k-tiny
+python main.py --model smoke --bias b-const    --data synthetic-copy
+python main.py --model base  --bias attn-bQbV  --data multi30k-tiny --optimizer adamw
+python main.py --model small --bias b-gaussian --data multi30k-tiny --set train.egd.lr=0.05
+```
+
+From Python, the same thing:
+
+```python
+from transformer_sym.config import make_config
+
+cfg = make_config(model="small", bias="b-gaussian", data="multi30k-tiny")
+# or hand it dataclasses instead of names:
+from transformer_sym.config import ModelConfig, BiasConfig, EmbeddingBiasConfig
+cfg = make_config(
+    model=ModelConfig(d_model=256, n_heads=8),
+    bias=BiasConfig(embed=EmbeddingBiasConfig(mode="const", const_value=1.0)),
+    data="multi30k",
+)
+```
+
+`make_config` deep-copies whatever it takes, so mutating the returned config
+never corrupts a preset. Adding your own preset is one dict entry:
+
+```python
+MODEL_PRESETS["my-run"] = ModelConfig(d_model=320, n_heads=8, d_ff=1280)
+```
+
+The three bias experiments you actually care about reduce to:
+
+```bash
+for b in symmetric b-gaussian b-const; do
+  python main.py --model small --bias $b --data multi30k-tiny
+done
+```
+
+### 7b. Whole-experiment YAML files
+
+Each file in `configs/` is a complete experiment (model + bias + data + train),
+which is handy for archiving or sharing an exact setting:
+
 | config | purpose |
 |---|---|
 | `smoke_synthetic.yaml` | 30-step end-to-end verification on CPU, no network |
@@ -348,13 +429,16 @@ changing your experiment.
 | `attn_bias_bQbV.yaml` | `bQ` + `bV` (Q-K and V-O) |
 | `attn_bias_full.yaml` | all three sectors, **learnable** biases |
 
-A minimal bias comparison (identical in every other respect):
-
 ```bash
+python main.py --list-configs
 for c in bias_zero bias_embed_gaussian bias_embed_const; do
   python main.py --config configs/$c.yaml
 done
 ```
+
+`--config` and `--model` are alternatives; passing both is an error. Every run
+writes its fully resolved config to `runs/<run-name>/config.yaml`, so a
+preset-driven run is reproducible even without the YAML file.
 
 ---
 

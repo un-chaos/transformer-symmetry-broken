@@ -3,16 +3,32 @@
 
 Examples
 --------
-List the ready-made configs::
+There are two ways to specify an experiment.
+
+**1. Named presets** defined in ``transformer_sym/config.py`` (the reference
+project's style). Show them, with exact parameter counts::
+
+    python main.py --list-models
+
+Then compose one out of the three preset tables -- model shape, data source and
+bias setting::
+
+    python main.py --model small --bias b-gaussian --data multi30k-tiny
+    python main.py --model smoke --bias b-const --data synthetic-copy
+
+**2. A YAML file** holding a whole experiment (see ``configs/``)::
 
     python main.py --list-configs
-
-Train with a preset (all network, bias and optimizer knobs live in the YAML)::
-
     python main.py --config configs/small_multi30k.yaml
 
 The "bias b" experiment the project exists for -- three runs that differ only in
-the embedding bias mode::
+the embedding bias mode. With the named presets::
+
+    python main.py --model small --bias symmetric  --data multi30k-tiny
+    python main.py --model small --bias b-gaussian --data multi30k-tiny
+    python main.py --model small --bias b-const    --data multi30k-tiny
+
+and with the equivalent YAML files::
 
     python main.py --config configs/bias_zero.yaml
     python main.py --config configs/bias_embed_gaussian.yaml
@@ -20,9 +36,8 @@ the embedding bias mode::
 
 Override any config field from the command line (values are parsed as YAML)::
 
-    python main.py --config configs/small_multi30k.yaml \
-        --set train.egd.lr=0.5 --set bias.embed.mode=gaussian \
-        --set train.batch_size=32
+    python main.py --model small --bias b-gaussian --data multi30k-tiny \
+        --set train.egd.lr=0.05 --set train.batch_size=32
 
 Check the data pipeline without training, or score a checkpoint::
 
@@ -44,7 +59,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from transformer_sym import __version__                      # noqa: E402
-from transformer_sym.config import load_config               # noqa: E402
+from transformer_sym.config import (                         # noqa: E402
+    MODEL_PRESETS,
+    load_config,
+    make_config,
+    preset_table,
+)
 from transformer_sym.utils import (                          # noqa: E402
     configure_console_encoding,
     environment_report,
@@ -65,7 +85,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         type=str,
         default=None,
-        help="path to a YAML config (see configs/); required unless --list-configs",
+        help="path to a YAML config (see configs/); alternative to --model",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        choices=sorted(MODEL_PRESETS),
+        help="model preset from transformer_sym/config.py (alternative to --config)",
+    )
+    parser.add_argument(
+        "--bias",
+        type=str,
+        default="symmetric",
+        help="bias preset name, e.g. symmetric / b-gaussian / b-const / attn-bQbV",
+    )
+    parser.add_argument(
+        "--data",
+        type=str,
+        default="multi30k",
+        help="data preset name, e.g. multi30k / multi30k-tiny / synthetic-copy",
+    )
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="egd",
+        choices=["egd", "adamw"],
+        help="optimizer preset (default: egd)",
     )
     parser.add_argument(
         "--set",
@@ -112,6 +158,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--list-configs", action="store_true", help="list available YAML configs and exit"
     )
+    parser.add_argument(
+        "--list-models",
+        action="store_true",
+        help="list the built-in model/data/bias presets with exact parameter counts",
+    )
+    parser.add_argument(
+        "--vocab",
+        type=int,
+        default=12000,
+        help="vocabulary size assumed by --list-models when counting parameters",
+    )
     parser.add_argument("--version", action="version", version=f"transformer-sym {__version__}")
     return parser
 
@@ -125,6 +182,37 @@ def list_configs() -> int:
     print(f"configs in {config_dir}:")
     for path in files:
         print(f"  {path.relative_to(ROOT)}")
+    return 0
+
+
+def list_presets(vocab: int = 12000) -> int:
+    """Print the Python presets and the exact parameter count of each model."""
+    from transformer_sym.data.tokenizer import PAD_ID, Tokenizer
+    from transformer_sym.model import Seq2SeqTransformer
+    from transformer_sym.utils import count_parameters
+
+    print(preset_table())
+    print()
+    print(
+        f"exact parameter counts (src_vocab = tgt_vocab = {vocab}; the vocabulary "
+        "dominates these numbers, so pass --vocab to match your dataset):"
+    )
+    for name in MODEL_PRESETS:
+        cfg = make_config(model=name, bias="symmetric", data="synthetic-copy")
+        model = Seq2SeqTransformer(
+            cfg.model,
+            cfg.bias,
+            src_vocab_size=vocab,
+            tgt_vocab_size=vocab,
+            pad_id=PAD_ID,
+            bos_id=Tokenizer.bos_id,
+            eos_id=Tokenizer.eos_id,
+        )
+        print(f"  {name:<9} {count_parameters(model):>12,} params")
+    print()
+    print("example:")
+    print("  python main.py --model small --bias b-gaussian --data multi30k-tiny \\")
+    print("      --set train.max_steps=2000 --set train.egd.lr=0.1")
     return 0
 
 
@@ -160,10 +248,31 @@ def main(argv=None) -> int:
 
     if args.list_configs:
         return list_configs()
-    if not args.config:
-        parser.error("--config is required (or use --list-configs)")
+    if args.list_models:
+        return list_presets(args.vocab)
 
-    cfg = load_config(args.config, overrides=args.overrides)
+    # Two ways in: a YAML file, or the named presets from transformer_sym/config.py.
+    if args.config and args.model:
+        parser.error("use either --config or --model, not both")
+
+    if args.config:
+        cfg = load_config(args.config, overrides=args.overrides)
+    elif args.model:
+        try:
+            cfg = make_config(
+                model=args.model,
+                bias=args.bias,
+                data=args.data,
+                optimizer=args.optimizer,
+                overrides=args.overrides,
+            )
+        except KeyError as exc:  # unknown preset name -> a clean CLI error
+            parser.error(str(exc).strip("\"'"))
+    else:
+        parser.error(
+            "give either --config <yaml> or --model <preset> "
+            "(see --list-configs and --list-models)"
+        )
 
     # Convenience overrides.
     if args.out_dir:
