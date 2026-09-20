@@ -284,3 +284,62 @@ def test_attention_bias_presets_train_end_to_end(tmp_path: Path):
     assert float(last[bq]) > 0.0, "bQ should be active"
     assert float(last[bv]) > 0.0, "bV should be active"
     assert float(last[bk]) == 0.0, "bK is off by default"
+
+
+# --------------------------------------------------------------------------- #
+# Resuming
+# --------------------------------------------------------------------------- #
+def test_resume_continues_from_a_checkpoint(tmp_path: Path):
+    """`--resume` restores model + optimizer and continues to the requested step."""
+    log_dir = tmp_path / "runs"
+    base = [
+        "--model", "smoke",
+        "--dataset_preset", "synthetic-copy",
+        "--batch_size", "16",
+        "--valid_every_updates", "6",
+        "--log_every", "6",
+        "--bias_preset", "b-gaussian",
+        "--log_dir", str(log_dir),
+        "--name", "resumed",
+        "--no_plot",
+    ]
+
+    first = run_cli("train", *base, "--max_steps", "6")
+    assert first.returncode == 0, joined(first)
+    ckpt = log_dir / "resumed" / "model_final.pt"
+    assert ckpt.exists(), sorted(p.name for p in (log_dir / "resumed").iterdir())
+
+    second = run_cli("train", *base, "--max_steps", "12", "--resume", ckpt)
+    assert second.returncode == 0, joined(second)
+    assert "[resume]" in joined(second), "the resume was not reported"
+
+    summary = json.loads(
+        (log_dir / "resumed" / "summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["steps"] == 12, f"resume did not advance to 12: {summary['steps']}"
+
+    # The log is appended to rather than truncated: header + rows from both runs.
+    rows = (log_dir / "resumed" / "training_log.csv").read_text(encoding="utf-8").splitlines()
+    assert len(rows) >= 5, f"the log was truncated on resume: {rows}"
+
+
+def test_resume_warns_but_continues_on_a_bad_checkpoint(tmp_path: Path):
+    """A missing or incompatible checkpoint must not abort the run."""
+    log_dir = tmp_path / "runs"
+    missing = tmp_path / "not-a-checkpoint.pt"
+    result = run_cli(
+        "train",
+        "--model", "smoke",
+        "--dataset_preset", "synthetic-copy",
+        "--batch_size", "16",
+        "--max_steps", "2",
+        "--valid_every_updates", "2",
+        "--log_every", "1",
+        "--bias_preset", "symmetric",
+        "--log_dir", str(log_dir),
+        "--name", "badresume",
+        "--resume", missing,
+        "--no_plot",
+    )
+    assert result.returncode == 0, joined(result)
+    assert (log_dir / "badresume" / "model_final.pt").exists()
