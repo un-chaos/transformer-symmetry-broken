@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.ipynb_checkpoints/
+
+# Test / tooling caches
+.pytest_cache/
+.vscode/
+# pytest leaves these behind when it cannot write its own basetemp
+pytest-cache-files-*/
+
+# Experiment output
+runs/
+*.pt
+*.pth
+
+# Downloaded corpora, cached raw files and tokenizers
+data/

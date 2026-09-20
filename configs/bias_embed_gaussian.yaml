@@ -1,0 +1,91 @@
+# bias_embed_gaussian.yaml
+# Embedding-bias ablation, FIXED draw: b ~ N(mean=0.0, std=0.02^2) element-wise over
+# the d_model dimensions, sampled once at initialisation (resample: fixed) and then
+# held constant for the whole run.
+#
+# Why this matters: a non-zero fixed b is added to the embedding (x = Embed(tokens)
+# * scale + b), so it is NOT invariant under a global rotation R of the feature
+# space -- b rotates to Rb != b. That breaks the O(d_model) rotation symmetry of the
+# embedding, which is the exact symmetry the zero-mode control (bias_zero.yaml)
+# preserves. Because b is drawn once and never redrawn, the symmetry breaking is a
+# fixed property of the parameterisation, not a source of stochastic noise in the
+# update rule. Compare against bias_zero.yaml (no breaking) and
+# bias_embed_gaussian_per_step.yaml (fresh breaking every step).
+model:
+  d_model: 256
+  n_heads: 8
+  n_encoder_layers: 3
+  n_decoder_layers: 3
+  d_ff: 1024
+  max_seq_len: 64
+  dropout: 0.1
+  attention_dropout: 0.0
+  activation: gelu
+  norm_first: false
+  scale_embedding: true
+  tie_output_embedding: true
+
+bias:
+  embed:
+    mode: gaussian
+    # Drawn once at init; never redrawn.
+    resample: fixed
+    mean: 0.0
+    std: 0.02
+    const_value: 1.0
+    # learnable: true would make b an nn.Parameter (it must then stay resample: fixed).
+    learnable: false
+    seed: 1234
+  attention:
+    enabled: false
+    mode: zero
+    resample: fixed
+
+data:
+  source: hf
+  data_dir: data
+  hf_repo: bentrevett/multi30k
+  hf_endpoint: https://hf-mirror.com
+  src_field: de
+  tgt_field: en
+  max_train_samples: 0
+  max_val_samples: 0
+  fallback_to_synthetic: true
+  tokenizer: word
+  lowercase: true
+  min_freq: 2
+  max_vocab: 30000
+  max_src_len: 0
+  max_tgt_len: 0
+
+train:
+  optimizer: egd
+  batch_size: 64
+  epochs: 8
+  max_steps: 0
+  log_every: 50
+  eval_every: 250
+  max_eval_batches: 20
+  bleu_every: 2000
+  bleu_samples: 200
+  save_dir: runs
+  run_name: bias_embed_gaussian
+  seed: 42
+  device: auto
+  num_workers: 0
+  egd:
+    # lr is tuned for these small CPU models. The reference implementation's
+    # lr=1.0 (a 124M-parameter GPT) diverges at this scale; a 150-step sweep
+    # on Multi30k measured a stable window of roughly 0.05 - 0.15 (README 5).
+    lr: 0.1
+    eta: 100.0
+    F0: null
+    auto_F0_margin: 1.0
+    nu: 0.0
+    weight_decay: 0.0
+    consEn: true
+  adamw:
+    lr: 3.0e-4
+    betas: [0.9, 0.98]
+    eps: 1.0e-8
+    weight_decay: 0.01

@@ -1,0 +1,113 @@
+# attn_bias_bQbV.yaml
+# Attention-bias ablation: bQ AND bV on, embedding bias at zero. Same surface as
+# attn_bias_bQ.yaml (mode=gaussian, resample=fixed, shared across heads and layers)
+# with v_enabled flipped to true; bK stays off.
+#
+# Why bV is the second, qualitatively different channel (power law):
+#   * bQ acts through the softmax, so its effect on the attention distribution is
+#     EXPONENTIAL in ||bQ|| -- a small shift is amplified.
+#   * bV acts on the V-O sector: v -> v + bV, then the output is
+#     sum_j a_j (v_j + bV) = sum_j a_j v_j + (sum_j a_j) bV. Because the attention
+#     weights sum to 1, bV enters the layer output ADDITIVELY, with weight exactly 1,
+#     independent of the softmax. Its effect is therefore LINEAR (power-law) in
+#     ||bV||, not amplified.
+#   * Like bQ, a fixed bV satisfies R bV != bV, so it breaks the corresponding
+#     rotational symmetry of the V-O sector; but it does so gently and additively.
+#   * bK is off for the same reason as in attn_bias_bQ.yaml: the key-independent
+#     part of a constant key shift cancels in the softmax normalisation.
+# Running this against attn_bias_bQ.yaml isolates exponential (softmax-mediated)
+# from linear (additive) symmetry breaking.
+model:
+  d_model: 256
+  n_heads: 8
+  n_encoder_layers: 3
+  n_decoder_layers: 3
+  d_ff: 1024
+  max_seq_len: 64
+  dropout: 0.1
+  attention_dropout: 0.0
+  activation: gelu
+  norm_first: false
+  scale_embedding: true
+  tie_output_embedding: true
+
+bias:
+  embed:
+    # Left at zero: only the attention biases break symmetry here.
+    mode: zero
+    resample: fixed
+    mean: 0.0
+    std: 0.02
+  attention:
+    enabled: true
+    mode: gaussian
+    resample: fixed
+    const_value: 1.0
+    learnable: false
+    share_across_heads: true
+    share_across_layers: true
+    apply_encoder: true
+    apply_decoder_self: true
+    apply_decoder_cross: true
+    # bQ: exponential breaking through the softmax.
+    q_enabled: true
+    q_mean: 0.5
+    q_std: 0.05
+    # bK off: a constant key shift partly cancels in the softmax.
+    k_enabled: false
+    k_mean: 0.3
+    k_std: 0.1
+    # bV: linear / power-law breaking in the V-O sector.
+    v_enabled: true
+    v_mean: 0.5
+    v_std: 0.05
+    seed: 1234
+
+data:
+  source: hf
+  data_dir: data
+  hf_repo: bentrevett/multi30k
+  hf_endpoint: https://hf-mirror.com
+  src_field: de
+  tgt_field: en
+  max_train_samples: 0
+  max_val_samples: 0
+  fallback_to_synthetic: true
+  tokenizer: word
+  lowercase: true
+  min_freq: 2
+  max_vocab: 30000
+  max_src_len: 0
+  max_tgt_len: 0
+
+train:
+  optimizer: egd
+  batch_size: 64
+  epochs: 8
+  max_steps: 0
+  log_every: 50
+  eval_every: 250
+  max_eval_batches: 20
+  bleu_every: 2000
+  bleu_samples: 200
+  save_dir: runs
+  run_name: attn_bias_bQbV
+  seed: 42
+  device: auto
+  num_workers: 0
+  egd:
+    # lr is tuned for these small CPU models. The reference implementation's
+    # lr=1.0 (a 124M-parameter GPT) diverges at this scale; a 150-step sweep
+    # on Multi30k measured a stable window of roughly 0.05 - 0.15 (README 5).
+    lr: 0.1
+    eta: 100.0
+    F0: null
+    auto_F0_margin: 1.0
+    nu: 0.0
+    weight_decay: 0.0
+    consEn: true
+  adamw:
+    lr: 3.0e-4
+    betas: [0.9, 0.98]
+    eps: 1.0e-8
+    weight_decay: 0.01

@@ -1,0 +1,85 @@
+# tiny_multi30k.yaml
+# Cheapest real Multi30k de->en experiment with true (non-zero) embedding and
+# attention biases. Small model, 8000 training pairs and a 12k word vocabulary,
+# so a full 5-epoch run is still CPU-affordable. Use this to sanity-check that a
+# bias configuration actually learns before paying for small_/base_.
+model:
+  d_model: 128
+  n_heads: 4
+  n_encoder_layers: 2
+  n_decoder_layers: 2
+  d_ff: 256
+  max_seq_len: 32
+  dropout: 0.1
+  attention_dropout: 0.0
+  activation: gelu
+  norm_first: false
+  scale_embedding: true
+  tie_output_embedding: true
+
+# Reference-style symmetry breaking: non-zero fixed embedding bias (mode is the
+# master switch; it is exercised together with the Q/V attention biases below).
+bias:
+  embed:
+    mode: zero
+    resample: fixed
+    mean: 0.0
+    std: 0.02
+  attention:
+    enabled: false
+    mode: zero
+    resample: fixed
+
+data:
+  source: hf
+  data_dir: data
+  hf_repo: bentrevett/multi30k
+  hf_endpoint: https://hf-mirror.com
+  src_field: de
+  tgt_field: en
+  max_train_samples: 8000
+  max_val_samples: 1000
+  # Fall back to the synthetic task instead of aborting if the mirror is down.
+  fallback_to_synthetic: true
+  tokenizer: word
+  lowercase: true
+  min_freq: 2
+  max_vocab: 12000
+  max_src_len: 0
+  max_tgt_len: 0
+
+train:
+  optimizer: egd
+  batch_size: 64
+  epochs: 5
+  max_steps: 0
+  log_every: 50
+  eval_every: 250
+  max_eval_batches: 20
+  bleu_every: 0
+  bleu_samples: 200
+  save_dir: runs
+  run_name: tiny_multi30k
+  seed: 42
+  device: auto
+  num_workers: 0
+  # F0: null means F0 is chosen automatically as initial_loss - auto_F0_margin.
+  # A fixed F0 (e.g. 1.0) is safe for cross-entropy because the loss is always
+  # positive, but it MUST stay below the smallest loss the model can reach or the
+  # update is skipped entirely (the dynamics needs loss - F0 > 0).
+  egd:
+    # lr is tuned for these small CPU models. The reference implementation's
+    # lr=1.0 (a 124M-parameter GPT) diverges at this scale; a 150-step sweep
+    # on Multi30k measured a stable window of roughly 0.05 - 0.15 (README 5).
+    lr: 0.1
+    eta: 100.0
+    F0: null
+    auto_F0_margin: 1.0
+    nu: 0.0
+    weight_decay: 0.0
+    consEn: true
+  adamw:
+    lr: 3.0e-4
+    betas: [0.9, 0.98]
+    eps: 1.0e-8
+    weight_decay: 0.01

@@ -1,0 +1,90 @@
+# bias_embed_gaussian_per_step.yaml
+# Embedding-bias ablation, PER-STEP redraw: identical to bias_embed_gaussian.yaml
+# (b ~ N(mean=0.0, std=0.02^2), element-wise over d_model) except that
+# bias.embed.resample is per_step, so b is redrawn from the same distribution every
+# optimizer step.
+#
+# Why this matters: b is redrawn every optimizer step, so the rotation-symmetry
+# breaking of the embedding is not a fixed feature of the parameterisation but a
+# stochastic perturbation applied on each update. The loss surface the optimizer
+# sees therefore changes between steps -- this isolates whether continuously
+# re-injected symmetry breaking (rather than one fixed non-zero b) is what helps or
+# hurts. Note: per_step is incompatible with learnable: true (b would be a parameter
+# and also be overwritten), which is why learnable stays false here.
+model:
+  d_model: 256
+  n_heads: 8
+  n_encoder_layers: 3
+  n_decoder_layers: 3
+  d_ff: 1024
+  max_seq_len: 64
+  dropout: 0.1
+  attention_dropout: 0.0
+  activation: gelu
+  norm_first: false
+  scale_embedding: true
+  tie_output_embedding: true
+
+bias:
+  embed:
+    mode: gaussian
+    # Redrawn on every optimizer step.
+    resample: per_step
+    mean: 0.0
+    std: 0.02
+    const_value: 1.0
+    learnable: false
+    seed: 1234
+  attention:
+    enabled: false
+    mode: zero
+    resample: fixed
+
+data:
+  source: hf
+  data_dir: data
+  hf_repo: bentrevett/multi30k
+  hf_endpoint: https://hf-mirror.com
+  src_field: de
+  tgt_field: en
+  max_train_samples: 0
+  max_val_samples: 0
+  fallback_to_synthetic: true
+  tokenizer: word
+  lowercase: true
+  min_freq: 2
+  max_vocab: 30000
+  max_src_len: 0
+  max_tgt_len: 0
+
+train:
+  optimizer: egd
+  batch_size: 64
+  epochs: 8
+  max_steps: 0
+  log_every: 50
+  eval_every: 250
+  max_eval_batches: 20
+  bleu_every: 2000
+  bleu_samples: 200
+  save_dir: runs
+  run_name: bias_embed_gaussian_per_step
+  seed: 42
+  device: auto
+  num_workers: 0
+  egd:
+    # lr is tuned for these small CPU models. The reference implementation's
+    # lr=1.0 (a 124M-parameter GPT) diverges at this scale; a 150-step sweep
+    # on Multi30k measured a stable window of roughly 0.05 - 0.15 (README 5).
+    lr: 0.1
+    eta: 100.0
+    F0: null
+    auto_F0_margin: 1.0
+    nu: 0.0
+    weight_decay: 0.0
+    consEn: true
+  adamw:
+    lr: 3.0e-4
+    betas: [0.9, 0.98]
+    eps: 1.0e-8
+    weight_decay: 0.01

@@ -1,0 +1,119 @@
+# attn_bias_bQ.yaml
+# Attention-bias ablation: ONLY bQ is on (bQ != 0), with the embedding bias left at
+# zero so the single breaking channel is isolated.
+#
+# Surface: q_enabled=true, k_enabled=false, v_enabled=false, mode=gaussian,
+# resample=fixed, share_across_heads/share_across_layers=true (one head_dim vector
+# shared by every head and every layer, i.e. the reference behaviour).
+#
+# Why bQ matters and why bK is off:
+#   * bQ shifts the queries, q -> q + bQ. The attention logits are q.k / sqrt(d_head),
+#     so a fixed bQ perturbs every logit of every token in the SAME direction along
+#     the k directions it overlaps. A rotation R of the Q-K feature space maps
+#     bQ -> RbQ != bQ, so the per-head O(d_head) rotation symmetry of the Q-K sector
+#     (an exact symmetry when bQ = 0) is broken by a fixed non-zero bQ.
+#   * The softmax then amplifies that breaking exponentially: logit perturbations
+#     enter as exp(), so a small ||bQ|| produces a much larger relative change in the
+#     attention distribution than the same magnitude of bV would produce in the
+#     output. That amplification is the whole point of this preset.
+#   * bK is deliberately OFF: a constant shift of the keys contributes
+#     (q + bQ).(k + bK) whose bK part contains a term q.bK that depends only on the
+#     query, so after the softmax normalisation over keys that part cancels (it is
+#     the same additive constant on every key of a row). Only the key-DEPENDENT
+#     part of bK survives, which makes bK a strictly weaker knob than bQ. It stays
+#     available (config key k_enabled) but is not exercised here.
+model:
+  d_model: 256
+  n_heads: 8
+  n_encoder_layers: 3
+  n_decoder_layers: 3
+  d_ff: 1024
+  max_seq_len: 64
+  dropout: 0.1
+  attention_dropout: 0.0
+  activation: gelu
+  norm_first: false
+  scale_embedding: true
+  tie_output_embedding: true
+
+bias:
+  embed:
+    # Left at zero: the ONLY symmetry breaking in this run comes from bQ.
+    mode: zero
+    resample: fixed
+    mean: 0.0
+    std: 0.02
+  attention:
+    enabled: true
+    mode: gaussian
+    resample: fixed
+    const_value: 1.0
+    learnable: false
+    # One shared head_dim vector (reference behaviour) rather than per-head draws.
+    share_across_heads: true
+    share_across_layers: true
+    apply_encoder: true
+    apply_decoder_self: true
+    apply_decoder_cross: true
+    # bQ on ...
+    q_enabled: true
+    q_mean: 0.5
+    q_std: 0.05
+    # ... bK off (constant-shift part cancels inside the softmax) ...
+    k_enabled: false
+    k_mean: 0.3
+    k_std: 0.1
+    # ... bV off.
+    v_enabled: false
+    v_mean: 0.5
+    v_std: 0.05
+    seed: 1234
+
+data:
+  source: hf
+  data_dir: data
+  hf_repo: bentrevett/multi30k
+  hf_endpoint: https://hf-mirror.com
+  src_field: de
+  tgt_field: en
+  max_train_samples: 0
+  max_val_samples: 0
+  fallback_to_synthetic: true
+  tokenizer: word
+  lowercase: true
+  min_freq: 2
+  max_vocab: 30000
+  max_src_len: 0
+  max_tgt_len: 0
+
+train:
+  optimizer: egd
+  batch_size: 64
+  epochs: 8
+  max_steps: 0
+  log_every: 50
+  eval_every: 250
+  max_eval_batches: 20
+  bleu_every: 2000
+  bleu_samples: 200
+  save_dir: runs
+  run_name: attn_bias_bQ
+  seed: 42
+  device: auto
+  num_workers: 0
+  egd:
+    # lr is tuned for these small CPU models. The reference implementation's
+    # lr=1.0 (a 124M-parameter GPT) diverges at this scale; a 150-step sweep
+    # on Multi30k measured a stable window of roughly 0.05 - 0.15 (README 5).
+    lr: 0.1
+    eta: 100.0
+    F0: null
+    auto_F0_margin: 1.0
+    nu: 0.0
+    weight_decay: 0.0
+    consEn: true
+  adamw:
+    lr: 3.0e-4
+    betas: [0.9, 0.98]
+    eps: 1.0e-8
+    weight_decay: 0.01
