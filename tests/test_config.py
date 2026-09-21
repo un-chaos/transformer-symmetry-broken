@@ -235,14 +235,22 @@ def test_describe_is_informative():
 
 
 def test_egd_defaults_are_the_tuned_ones():
-    """Regression guard on the two optimizer settings that were wrong at first."""
+    """Regression guard on the optimizer settings that were wrong at first.
+
+    ``lr`` and ``F0`` are coupled (``lr`` multiplies the kick, ``loss - F0``
+    divides it), so they are asserted together: the automatic ``F0`` used to
+    freeze training after one nat, and an ``lr`` tuned against it is roughly ten
+    times too small once ``F0`` is a fixed safe value.
+    """
     from symbreak_transformer.optimizer import EGD
 
     opt = EGD([torch.nn.Parameter(torch.zeros(2))])
-    assert opt.lr == pytest.approx(0.1), (
-        "the upstream reference's lr=1.0 diverges at this model scale"
+    assert opt.F0 == pytest.approx(-1.0), (
+        "F0 must default BELOW any reachable cross-entropy loss; "
+        "F0=None (initial_loss - 1) silently stops training after one nat"
     )
-    assert opt.F0 is None, (
-        "a fixed F0 above the reachable loss silently freezes training"
+    assert opt.lr == pytest.approx(1.0), (
+        "lr is tuned together with F0=-1; ~10x larger than the value that "
+        "suited the old automatic F0"
     )
     assert opt.eta == pytest.approx(100.0)

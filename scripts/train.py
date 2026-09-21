@@ -576,10 +576,20 @@ def build_parser() -> argparse.ArgumentParser:
     # --- optimizer --------------------------------------------------------- #
     g = ap.add_argument_group("optimizer")
     g.add_argument("--optimizer", choices=["egd", "adamw", "sgdm"], default="egd")
-    g.add_argument("--egd_lr", type=float, default=0.1)
+    g.add_argument("--egd_lr", type=float, default=1.0,
+                   help="learning rate, rescaled internally by 1/sqrt(eta). "
+                        "Tuned together with the default F0=-1")
     g.add_argument("--egd_eta", type=float, default=100.0)
-    g.add_argument("--egd_F0", type=float, default=None,
-                   help="loss offset; omit for initial_loss - auto_F0_margin")
+    g.add_argument("--egd_F0", type=float, default=-1.0,
+                   help="loss offset; must stay BELOW the smallest reachable "
+                        "loss or updates stop. -1 is always safe for "
+                        "cross-entropy, which is >= 0")
+    g.add_argument("--egd_auto_F0", action="store_true",
+                   help="resolve F0 as initial_loss - auto_F0_margin instead. "
+                        "WARNING: this STOPS training once the loss has improved "
+                        "by that margin (1.0 by default), so it truncates runs")
+    g.add_argument("--egd_auto_F0_margin", type=float, default=1.0,
+                   help="margin used when --egd_auto_F0 is set")
     g.add_argument("--egd_nu", type=float, default=0.0)
     g.add_argument("--egd_eps1", type=float, default=1e-10)
     g.add_argument("--egd_eps2", type=float, default=1e-40)
@@ -930,7 +940,10 @@ def main() -> None:
     # ---------------- optimizer ---------------- #
     if args.optimizer == "egd":
         kwargs = dict(
-            lr=args.egd_lr, eta=args.egd_eta, F0=args.egd_F0, nu=args.egd_nu,
+            lr=args.egd_lr, eta=args.egd_eta,
+            F0=None if args.egd_auto_F0 else args.egd_F0,
+            auto_F0_margin=args.egd_auto_F0_margin,
+            nu=args.egd_nu,
             eps1=args.egd_eps1, eps2=args.egd_eps2, weight_decay=args.egd_wd,
             consEn=args.egd_consEn, seed=args.egd_seed,
         )

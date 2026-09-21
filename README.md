@@ -1,12 +1,39 @@
 # Symmetry-breaking encoder-decoder Transformer with an energy-conserving optimizer
 
+## 快速上手（中文）
+
+不想碰命令行、不想读代码的话：**双击 `run.bat`**，然后按提示输入数字就行。
+
+```
+双击 run.bat  →  输入 1（跑三种 bias 做对比）  →  输入 1（玩具任务，15 秒，不用联网）
+```
+
+跑完会自动生成对比图和一份中文报告：
+
+- `runs\_compare\compare.png` —— 三种 bias 的验证损失曲线叠在一起
+- `runs\_compare\compare.txt` —— 中文表格 + 「怎么看」的结论
+- `runs\_compare\compare.csv` —— 同样的表格，可用 Excel 打开
+
+想换设置再跑：再运行一次 `run.bat`，选 `2`（只跑一种 bias），用数字选「跑多久」
+和「用哪种 bias」；或者直接编辑 `my_config.py`（每项都有中文注释），
+然后选菜单 `3`。
+
+**完整中文说明见 [`使用说明.md`](使用说明.md)**（包含常见问题、名词解释、
+每种 bias 是什么意思、结果怎么看）。下面英文部分是这个项目的技术说明和完整参数表。
+
+---
+
+## Overview (English)
+
 This package implements an **encoder-decoder Transformer** together with an
 explicit, configurable **embedding-bias symmetry-breaking mechanism** and the
 **EGD (Energy-conserving Gradient Descent)** optimizer, so that the effect of
 deliberately breaking attention's rotational symmetry can be studied directly.
 It includes the training code, two alternative optimizers for comparison
-(AdamW, SGD with momentum), an evaluation script and an analysis script that
-measures how much the injected bias actually changes what the model computes.
+(AdamW, SGD with momentum), an evaluation script, an analysis script that
+measures how much the injected bias actually changes what the model computes,
+and a comparison report that turns a directory full of runs into one figure and
+one table.
 
 The layout, the configuration style (`config.py` presets + command-line flags +
 `examples/*.sh`), the run-output conventions and the training-script shape follow
@@ -15,6 +42,17 @@ the companion project
 which studies the same physics on a decoder-only GPT. AI coding assistance
 contributed substantially to this package, including code generation and
 facilitating testing and analysis.
+
+### Two ways to drive it
+
+| | for | how |
+|---|---|---|
+| **Foolproof** | running the bias comparison without touching code | double-click `run.bat`, or `python run.py`, and answer the numbered menu |
+| **Scriptable** | scripting, sweeping, reproducing a published setting | `python main.py <command> [flags]`, or `examples/*.sh` |
+
+`run.py` is a thin front-end: it asks a couple of questions, then invokes
+`main.py` for you and shows the comparison report at the end. Anything it can do
+you can also do by hand — see "Quick Start" below.
 
 ## Key Idea
 
@@ -109,7 +147,7 @@ flags onto `python main.py train` directly.)
 
 ```bash
 python main.py train --model small --dataset_preset multi30k-tiny \
-    --optimizer egd --egd_lr 0.1 --egd_eta 100 --egd_F0 null \
+    --optimizer egd --egd_lr 1.0 --egd_eta 100 --egd_F0 -1.0 \
     --use_q_bias --use_v_bias --mean_Q 0.5 --std_Q 0.05 --mean_V 0.5 --std_V 0.05 \
     --name small-egd-bQbV
 ```
@@ -167,6 +205,8 @@ Each training run saves to `runs/<run-name>/` with:
   a quick loss-versus-step check or a scripted comparison
 - `summary.json` — the run summary (steps, parameters, optimizer, best val loss)
 - `config.json`, `bias.json`, `args.json` — the resolved configuration
+- `training_log.meta.json` — run name, parameter count, config and bias, written
+  when the run starts, so an interrupted run is still identifiable
 - `tokenizer_src.json`, `tokenizer_tgt.json` — the exact vocabularies used
 - `training_curve.png` — loss and bias-norm curves (skip with `--no_plot`)
 
@@ -224,7 +264,11 @@ vocabulary means the checkpoint will not load).
 
 ```
   .
-  ├── main.py                     # single entry point: train / evaluate / analyze-bias / plot
+  ├── run.bat                     # Windows: double-click this
+  ├── run.py                      # the numbered menu behind run.bat
+  ├── my_config.py                # optional control panel (Chinese comments)
+  ├── 使用说明.md                  # plain-language Chinese guide
+  ├── main.py                     # scriptable entry point: train / evaluate / analyze-bias / report / plot
   ├── symbreak_transformer/
   │   ├── config.py               # Seq2SeqConfig + PRESETS, BiasConfig + BiasPresets, DataConfig
   │   ├── optimizer.py            # EGD (energy-conserving descent), AdamW/SGDM builders
@@ -246,7 +290,9 @@ vocabulary means the checkpoint will not load).
   │   ├── train.py                # unified training script (all flags)
   │   ├── evaluate.py             # checkpoint scoring: loss + BLEU
   │   ├── analyze_bias.py         # inventory and measured effect of the bias
-  │   └── plot_curve.py           # training curves from training_log.csv
+  │   ├── report.py               # every run -> one comparison figure + one Chinese table
+  │   ├── plot_curve.py           # single-run training curve
+  │   └── _common.py              # shared data flags / checkpoint loading for the scripts
   ├── examples/                   # archived flag sets, one per experiment
   ├── tests/                      # pytest suite
   └── requirements.txt
@@ -256,37 +302,47 @@ vocabulary means the checkpoint will not load).
 
 ### EGD Optimizer (`--optimizer egd`)
 
-- `--egd_lr`: **0.1** (rescaled internally by `1/sqrt(eta)`)
+- `--egd_lr`: **1.0** (rescaled internally by `1/sqrt(eta)`)
 - `--egd_eta`: 100 (concentration parameter)
-- `--egd_F0`: **null** — `null` means `initial_loss - auto_F0_margin`
+- `--egd_F0`: **-1.0** — a loss offset that is guaranteed to sit below any
+  cross-entropy loss
 - `--egd_nu`: 0.0 (momentum noise amplitude)
 - `--egd_consEn`: True (energy-conservation rescaling)
 
-Two of these defaults differ from the companion project on purpose.
-
 **`F0` must stay below the smallest loss the model can reach.** The step is only
-taken while `loss - F0 > eps2`; if `F0` sits above the loss the updates stop and
-training silently freezes, and as `loss -> F0+` the denominator collapses and the
-step explodes. `null` (auto) is always safe, and is the default.
+taken while `loss - F0 > eps2`, so an `F0` above the reachable loss freezes
+training without any error message. Cross-entropy is always `>= 0`, so `F0 = -1`
+is always safe and the denominator `loss - F0 = loss + 1` can never collapse.
+That is the default.
 
-**`lr` is not the reference value.** The companion project ships `lr=1.0`, tuned
-on a 124M-parameter GPT; at this model scale that diverges immediately. A
-150-step sweep on Multi30k (4 000 train pairs, `n_embd=128`, 2+2 layers, target
-vocab 2 041, `eta=100`, `F0` auto) measured:
+`--egd_auto_F0` is available for the companion project's convention
+(`F0 = initial_loss - auto_F0_margin`), but **read the warning**: it stops
+training as soon as the loss has improved by the margin. With the default margin
+of `1.0` that truncates a run after a single nat — measured on this repo, val
+loss pinned at `5.6905` from step 64 onward instead of continuing to `5.49`. It is
+useful only when you set the margin larger than the total improvement you expect.
 
-| `--egd_lr` | step 25 | step 50 | step 100 | step 150 | val loss | behaviour |
-|---|---|---|---|---|---|---|
-| 0.05 | 7.454 | 7.281 | 6.847 | **6.268** | 6.300 | stable, steady |
-| **0.1** (default) | 7.272 | 6.373 | 6.285 | 6.382 | 6.312 | stable, fastest early |
-| 0.15 | 6.883 | 6.419 | 6.343 | 6.424 | 6.343 | stable |
-| 0.2 | 36.69 | 28.50 | 7.485 | 6.244 | **5.822** | early excursion, then recovers |
-| 0.3 | 6.94 | 6.41 | 2859.8 | 2629.3 | — | diverges |
-| 1.0 | 11.44 | 29.95 | 16.42 | 10.09 | — | chaotic |
+**`lr` and `F0` are coupled, so they were retuned together.** `lr` multiplies the
+kick while `loss - F0` divides it; a smaller `F0` makes the denominator larger and
+therefore needs a larger `lr`. An `lr` tuned against the old automatic `F0` is
+roughly **ten times too small** once `F0 = -1`. Measured on `multi30k-quick`
+(2 000 pairs, `n_embd=128`, `tiny`, 126 steps, `eta=100`, `F0=-1`, validation loss
+at each checkpoint):
 
-So the usable window is roughly `0.05 - 0.15`. Note that `0.2` recovering after a
-large excursion is expected: EGD is a Hamiltonian flow designed to explore and
-then concentrate, not a monotone descent. If you change the model size or dataset
-substantially, re-check `lr` the same way.
+| `--egd_lr` | step 40 | step 80 | step 120 | best val loss | behaviour |
+|---|---|---|---|---|---|
+| 0.1 | 6.612 | 6.001 | 5.553 | 5.493 | stable but far too slow |
+| 0.3 | 5.497 | 4.785 | 4.523 | 4.497 | stable |
+| **1.0** (default) | 4.480 | 4.331 | 4.203 | 4.177 | stable, fast |
+| 2.0 | 4.378 | 4.072 | 3.953 | **3.722** | stable, best here |
+| 4.0 | 20.70 | 14.48 | 5.019 | 5.019 | early blow-up, then recovers |
+
+So the usable window with `F0 = -1` is roughly **`0.3 - 2.0`**, and the default
+`1.0` sits comfortably inside it (it is also the companion project's value). The
+`4.0` row is not a bug: EGD is a Hamiltonian flow designed to explore and then
+concentrate, so a large excursion that recovers is expected behaviour — but it
+makes the run's outcome seed-dependent, so it is not a good default. If you change
+`F0`, the model size or the dataset substantially, re-check `lr` the same way.
 
 ### Embedding Bias `b` (`--bias_mode`)
 

@@ -52,6 +52,7 @@ COMMANDS = {
     "train": "scripts/train.py",
     "evaluate": "scripts/evaluate.py",
     "analyze-bias": "scripts/analyze_bias.py",
+    "report": "scripts/report.py",
     "plot": "scripts/plot_curve.py",
 }
 
@@ -59,7 +60,8 @@ _DESCRIPTIONS = {
     "train": "train an encoder-decoder Transformer",
     "evaluate": "score a checkpoint (loss + corpus BLEU)",
     "analyze-bias": "measure the effect of the symmetry-breaking bias",
-    "plot": "draw the training curve of a finished run",
+    "report": "compare every finished run: one figure + a table",
+    "plot": "draw the training curve of a single run",
 }
 
 

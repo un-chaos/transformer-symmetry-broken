@@ -91,14 +91,27 @@ class EGD(Optimizer):
     Args:
         params: iterable of ``torch.nn.Parameter`` (or param groups) to optimise.
         lr: learning rate; internally rescaled to ``lr / sqrt(eta)``.  The default
-            ``0.1`` is the value tuned for this repository's small seq2seq runs.
+            ``1.0`` is the value tuned for this repository's runs *together with
+            the default* ``F0``.  The two are coupled: ``lr`` multiplies the kick
+            while ``loss - F0`` divides it, so a different ``F0`` needs a
+            different ``lr`` (see the note on ``F0`` below).
         eta: concentration parameter controlling how sharply the dynamics
             concentrates around low loss.
-        F0: loss offset; must stay *below* the smallest reachable loss or every
-            update is skipped.  ``F0=None`` (the default) resolves it at the first
-            step to ``Finit - auto_F0_margin``.  The reference's fixed ``-1`` is
-            wrong for a cross-entropy loss that starts around ``log(vocab)``.
+        F0: loss offset; must stay *below* the smallest loss the model can reach,
+            otherwise every update is skipped once training gets there.  The
+            default is ``-1.0``: cross-entropy is always ``>= 0``, so ``-1.0`` is
+            guaranteed to sit below the reachable minimum, and the denominator
+            ``loss - F0 = loss + 1 >= 1`` can never collapse.  ``F0=None``
+            resolves it at the first step to ``Finit - auto_F0_margin``, which is
+            only a good idea if the margin exceeds the total improvement you
+            expect (see the note on ``auto_F0_margin``).
         auto_F0_margin: how far below the initial loss an automatic ``F0`` sits.
+            **This stops training when the loss has improved by that much**, so
+            the default margin of ``1.0`` truncates the run after one nat.  Left
+            at ``1.0`` deliberately: it is the reference project's convention, and
+            anyone who asks for an automatic ``F0`` should see the trade-off.  If
+            you want an automatic offset that does not truncate, pass a margin
+            larger than any improvement you expect (e.g. ``Finit + 10``).
         nu: amplitude of the Gaussian "bounce" added to the momenta each step
             (internally rescaled by ``1 / sqrt(dim)``); ``0`` disables the noise.
         eps1: numerical epsilon for the energy-conservation normalisation.
@@ -135,9 +148,9 @@ class EGD(Optimizer):
     def __init__(
         self,
         params: Iterable[torch.Tensor],
-        lr: float = 0.1,
+        lr: float = 1.0,
         eta: float = 100.0,
-        F0: Optional[float] = None,
+        F0: Optional[float] = -1.0,
         auto_F0_margin: float = 1.0,
         nu: float = 0.0,
         eps1: float = 1e-10,
@@ -580,8 +593,10 @@ def build_optimizer(
     Args:
         model: the model whose parameters are optimised.
         kind: ``"egd"``, ``"adamw"`` or ``"sgdm"`` (case-insensitive).
-        egd_kwargs: arguments for :class:`EGD`; defaults to ``lr=0.1, F0=None``
-            (tuned for this repository's runs).
+        egd_kwargs: arguments for :class:`EGD`; defaults to
+            ``lr=1.0, F0=-1.0`` (tuned together for this repository's runs -- see
+            the ``F0`` note on :class:`EGD`; changing one needs the other
+            retuned).
         adamw_kwargs: arguments for ``torch.optim.AdamW``; defaults to
             ``lr=1e-3, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1``.
         sgdm_kwargs: arguments for ``torch.optim.SGD``; defaults to
@@ -602,7 +617,7 @@ def build_optimizer(
 
     name = str(kind).strip().lower()
     if name == "egd":
-        kwargs: Dict[str, Any] = {"lr": 0.1, "F0": None}
+        kwargs: Dict[str, Any] = {"lr": 1.0, "F0": -1.0}
         kwargs.update(egd_kwargs or {})
         return EGD(params, **kwargs)
     if name == "adamw":

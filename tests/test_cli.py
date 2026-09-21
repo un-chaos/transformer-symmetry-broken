@@ -215,6 +215,21 @@ def test_plot_writes_a_png(trained_run: Path):
     assert png.stat().st_size > 0
 
 
+def test_report_compares_the_finished_runs(trained_run: Path):
+    """`main.py report` turns a log directory into one report + one figure."""
+    log_dir = trained_run.parent
+    result = run_cli("report", "--log_dir", log_dir)
+    assert result.returncode == 0, joined(result)
+
+    out = log_dir / "_compare"
+    assert (out / "compare.txt").exists(), joined(result)
+    assert (out / "compare.csv").exists(), joined(result)
+    text = (out / "compare.txt").read_text(encoding="utf-8")
+    assert trained_run.name in text, "the finished run is missing from the report"
+    if (out / "compare.png").exists():
+        assert (out / "compare.png").stat().st_size > 0
+
+
 # --------------------------------------------------------------------------- #
 # The three bias modes, end to end
 # --------------------------------------------------------------------------- #

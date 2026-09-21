@@ -414,6 +414,16 @@ BiasPresets: Dict[str, BiasConfig] = {
 #: real field names, so a preset can be splatted straight into ``DataConfig``.
 DATASET_PRESETS: Dict[str, Dict[str, Any]] = {
     "multi30k": {"source": "hf", "hf_repo": "bentrevett/multi30k"},
+    # The smallest slice that still shows real translation behaviour.  This is
+    # what the foolproof ``run.py`` menu offers as "quick": a couple of minutes
+    # on CPU instead of tens of minutes.
+    "multi30k-quick": {
+        "source": "hf",
+        "hf_repo": "bentrevett/multi30k",
+        "max_train_samples": 2000,
+        "max_val_samples": 300,
+        "max_vocab": 8000,
+    },
     "multi30k-tiny": {
         "source": "hf",
         "hf_repo": "bentrevett/multi30k",

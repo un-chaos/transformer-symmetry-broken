@@ -245,8 +245,11 @@ def test_egd_defaults_are_the_tuned_ones():
     """The tuned defaults live in ``EGD.__init__`` -- no ``EGDConfig`` any more."""
     w = torch.nn.Parameter(torch.zeros(3))
     opt = EGD([w])
-    assert opt.lr == 0.1
-    assert opt.F0 is None
+    assert opt.lr == 1.0
+    assert opt.F0 == -1.0, (
+        "F0 must default below any reachable cross-entropy loss: an automatic "
+        "F0 (initial_loss - 1) silently stops training after one nat"
+    )
     assert opt.eta == 100.0
     assert opt.nu == 0.0
     assert opt.auto_F0_margin == 1.0
@@ -277,7 +280,7 @@ def test_build_optimizer_selects_the_optimizer_and_drops_frozen_params():
     # ... and the same values are what ``build_optimizer`` uses by default.
     default_egd = build_optimizer(model, "egd")
     assert isinstance(default_egd, EGD)
-    assert default_egd.lr == 0.1 and default_egd.F0 is None
+    assert default_egd.lr == 1.0 and default_egd.F0 == -1.0
     assert default_egd.eta == 100.0 and default_egd.nu == 0.0
     assert {id(p) for p in default_egd.param_groups[0]["params"]} == expected
 

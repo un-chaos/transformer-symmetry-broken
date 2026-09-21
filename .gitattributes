@@ -1,0 +1,12 @@
+# Line endings matter here, not just cosmetically:
+#
+#   * cmd.exe mis-parses a .bat file that uses bare LF line endings, and a UTF-8
+#     BOM makes it choke on the very first command.  run.bat must therefore stay
+#     CRLF, so force it regardless of the cloner's core.autocrlf setting.
+#   * the example shell scripts must stay LF, or they fail under bash.
+#
+# The .bat is also kept ASCII-only outside its `echo` lines (see the test in
+# tests/test_run_and_report.py): cmd parses command lines in the OEM codepage, so
+# non-ASCII there gets mis-decoded and executed as garbage.
+*.bat text eol=crlf
+*.sh  text eol=lf
