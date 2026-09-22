@@ -14,12 +14,25 @@
 - `runs\_compare\compare.txt` —— 中文表格 + 「怎么看」的结论
 - `runs\_compare\compare.csv` —— 同样的表格，可用 Excel 打开
 
-想换设置再跑：再运行一次 `run.bat`，选 `2`（只跑一种 bias），用数字选「跑多久」
-和「用哪种 bias」；或者直接编辑 `my_config.py`（每项都有中文注释），
-然后选菜单 `3`。
+**每次训练的结果都会存下来**，在 `runs\<实验名>\` 里，一定有这几样：
+
+- `training_curve.png` —— 损失曲线图（训练 + 验证）
+- `model_summary.txt` —— 模型说明书：结构、维度、参数量花在哪
+- `training_log.csv` / `config.json` / `bias.json` / `args.json` / 模型权重
+
+**想自由调初始参数**（模型大小、学习率、batch size、数据集……）：选菜单 `4`
+打开 `my_config.py`，里面 `SETTINGS` 每一项都是真实的命令行参数，改完保存，
+选菜单 `3` 就跑。**没有任何参数是写死的**；文件底部有一份从 `train.py`
+自动生成的完整参数清单，菜单 `7` 也能直接查看。
+
+**想用大规模语料**（FineWeb-Edu 10B，约 28.5 GB）：选菜单 `8` 下载
+（断点续传，会另开一个窗口显示进度），然后把「跑多久」选成 `4`，
+或在 `my_config.py` 里写 `"--dataset_preset": 'fineweb-10b'` 配
+`"--objective": 'denoising'`。
 
 **完整中文说明见 [`使用说明.md`](使用说明.md)**（包含常见问题、名词解释、
-每种 bias 是什么意思、结果怎么看）。下面英文部分是这个项目的技术说明和完整参数表。
+每种 bias 是什么意思、结果怎么看、模型说明书怎么读、大数据怎么下）。
+下面英文部分是这个项目的技术说明和完整参数表。
 
 ---
 
@@ -189,7 +202,7 @@ python main.py plot --run runs/small-egd-bgaussian
 ### What is available
 
 ```bash
-python main.py --help                # the four subcommands
+python main.py --help                # the subcommands
 python main.py train --list_models   # model / bias / dataset presets + parameter counts
 ```
 
@@ -204,11 +217,56 @@ Each training run saves to `runs/<run-name>/` with:
 - `losses.csv` — an append-only `tag,loss` dump of every training step, handy for
   a quick loss-versus-step check or a scripted comparison
 - `summary.json` — the run summary (steps, parameters, optimizer, best val loss)
+- `model_summary.txt` — the full structure/dimension/parameter report (see below)
 - `config.json`, `bias.json`, `args.json` — the resolved configuration
 - `training_log.meta.json` — run name, parameter count, config and bias, written
   when the run starts, so an interrupted run is still identifiable
 - `tokenizer_src.json`, `tokenizer_tgt.json` — the exact vocabularies used
 - `training_curve.png` — loss and bias-norm curves (skip with `--no_plot`)
+
+### What did I just build? (`model_summary.txt`)
+
+Every run prints a model report before training starts and writes the same text to
+`runs/<run-name>/model_summary.txt`, so a result is interpretable long after the
+console has scrolled away. It answers four questions in one screen: the
+**architecture** (depth, width, heads, vocab, activation, dropout, the
+symmetry-breaking setting), the **per-component parameter counts** with the
+semantic shapes behind them, **where the parameters live** as a percentage
+breakdown, and which tensors are **non-learned buffers** (this project's bias `b`
+is a buffer: it is the object of study, not something training updates).
+
+```
+Architecture
+  n_embd (d_model)     : 128
+  n_head               : 4   (head_dim 32)
+  layers               : encoder 2, decoder 2
+  vocab                : source 400, target 400
+  tie_output_embedding : True
+  symmetry-breaking    : embedding b: mode=gaussian std=0.02 ...
+
+Components (learned parameters)
+  source embedding
+      params        55,296  ( 7.2%)   dims   embed 400x128, pos 32x128
+  encoder layer 0-1 (x2)
+      params       264,960  (34.3%)   dims   each: q/k/v/o 128x128 (+4 bias), ff 128->256, ln 128 x2
+  decoder layer 0-1 (x2)
+      params       397,568  (51.4%)   dims   each: q/k/v/o 128x128 x2 (+8 bias), ff 128->256, ln 128 x3
+  output projection
+      params             0  ( 0.0%)   dims   (shared / tied)
+  TOTAL              773,120  (100.0%)
+
+Where the parameters live
+  embeddings                  110,592    14.3%
+  encoder                     264,960    34.3%
+  decoder                     397,568    51.4%
+
+Non-learned buffers: 128 values in 1 tensor(s) (these are NOT trained)
+  src_embed.bias.b                128
+```
+
+Identical layers are merged into one `xN` row so the table stays readable at
+depth, and a tied weight is counted once and reported as `(shared / tied)` with 0
+own parameters, so the component column sums exactly to the total.
 
 `training_log.csv` columns:
 
@@ -392,13 +450,19 @@ makes the run's outcome seed-dependent, so it is not a good default. If you chan
 
 ## Data
 
-`--dataset` selects one of three providers:
+`--dataset` selects the **provider**, and `--dataset_preset` selects a named
+provider-plus-size combination:
 
 | `--dataset` | behaviour |
 |---|---|
 | `hf` | downloads parallel text from a HuggingFace **mirror** (default `https://hf-mirror.com`), caching the raw file under `data/raw/` |
 | `synthetic` | generates a deterministic toy task (`--synthetic_task copy/reverse/sort`) — no network at all |
 | `local` | reads `data/local/<split>.tsv` |
+| `fineweb` | reads **FineWeb-Edu** parquet shards from `--fineweb_dir` (downloaded separately) |
+
+Named presets: `synthetic-copy`, `synthetic-reverse`, `synthetic-sort`,
+`multi30k-quick` (2 000 pairs), `multi30k-tiny` (8 000), `multi30k` (all 29 000),
+`fineweb-quick`, `fineweb-10b`.
 
 The default task is `bentrevett/multi30k`, German → English image captions
 (29 000 train pairs, ~4.6 MB), fields selected with `--src_field` / `--tgt_field`.
@@ -411,15 +475,62 @@ The default task is `bentrevett/multi30k`, German → English image captions
 > If a download fails and `--no_fallback_to_synthetic` is not passed, the run
 > warns and continues on the synthetic task instead of crashing.
 
+### Large-scale corpus: FineWeb-Edu 10B
+
+`HuggingFaceFW/fineweb-edu`, config `sample/10BT` — roughly **10 B tokens in 14
+parquet shards (~28.5 GB)**. It is downloaded by a separate, **resumable** step,
+so an interrupted or closed download continues where it stopped instead of
+starting over:
+
+```bash
+python main.py download-data                 # fetch the shards (resumable)
+python main.py download-data --status        # how much is already on disk
+python main.py download-data --max_files 2   # just the first two shards (~4.3 GB)
+python main.py download-data --dest data/fineweb-edu/sample-10BT
+```
+
+`run.py` menu item **8** does the same thing in a **separate, visible console
+window**, so progress (or a stall) is observable rather than hidden behind the
+menu; the default destination is `data/fineweb-edu/sample-10BT`.
+
+FineWeb-Edu is **monolingual English**, so it cannot be used for translation. It
+is used with the span-corruption (T5-style denoising) objective instead, which
+needs no parallel data:
+
+```bash
+python main.py train --model small --dataset_preset fineweb-10b \
+    --objective denoising --fineweb_dir data/fineweb-edu/sample-10BT \
+    --bpe_vocab_size 32000 --tokenizer_train_documents 20000 \
+    --max_documents 0 --max_steps 2000
+```
+
+Under `--objective denoising` the encoder reads a document with a few spans
+replaced by `<extra_id_k>` sentinels and the decoder writes those spans back, so
+`src` and `tgt` share one BPE tokenizer and one vocabulary. The realized span
+count follows `--noise_density` (fraction of tokens removed, default 0.15) and
+`--mean_span_length`; `--tokenizer_train_documents` bounds how many documents the
+BPE tokenizer is trained on, and `--max_documents` bounds the corpus actually
+indexed. Validation documents are held out deterministically by `--val_every`.
+
+> **This machine trains on CPU only.** 10 B tokens is not a CPU budget: use
+> `--max_steps` (and `--max_documents`) to bound a run, and treat the corpus as
+> the thing the pipeline is *capable* of consuming rather than something to
+> exhaust. Building the shard index takes ~35 s over all 14 shards because only
+> row-group metadata is read up front.
+
 ## Tests
 
 ```bash
 python -m pytest tests -q
 ```
 
-142 tests, ~2.5 minutes on CPU. They cover the bias semantics (each mode,
+230 tests, ~4 minutes on CPU. They cover the bias semantics (each mode,
 resampling, learnable, per-sector independence), attention mask polarity and
 padding invariance, causality, weight tying, the EGD dynamics (`F0` floor,
 initialisation, checkpoint round trip), the tokenizer and collate contract,
-hand-computed BLEU values, and a full CLI end-to-end run — including a guard that
-every flag used in `examples/*.sh` exists in `scripts/train.py`.
+hand-computed BLEU values, the model-summary invariants (component rows sum to
+the distinct-parameter total, tied tensors reported once), the FineWeb/denoising
+path (BPE id layout, sentinel framing, span recovery, deterministic shuffling),
+a guard that every `scripts/train.py` option is reachable from `my_config.py`,
+and a full CLI end-to-end run — including a guard that every flag used in
+`examples/*.sh` exists in `scripts/train.py`.

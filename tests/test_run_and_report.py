@@ -129,7 +129,7 @@ def test_every_speed_entry_references_real_presets():
             f"speed {key}: unknown dataset preset {speed['dataset_preset']}"
         )
         assert speed["epochs"] >= 1
-        assert speed["key"] in {"toy", "quick", "long"}
+        assert speed["key"] in {"toy", "quick", "long", "corpus"}
 
 
 def test_every_bias_option_is_a_real_bias_preset():
@@ -174,9 +174,18 @@ def test_build_train_command_carries_every_setting():
         "--name quick-bgaussian",
         f"--log_every {speed['log_every']}",
         f"--valid_every_updates {speed['valid_every']}",
-        "--no_plot",
     ):
         assert expected in joined, f"{expected!r} missing from {command}"
+    # The loss curve must always be written: --no_plot would suppress it.
+    assert "--no_plot" not in command, (
+        "the menu path must save training_curve.png, so it must not pass --no_plot"
+    )
+
+
+def test_menu_never_disables_plotting_for_any_speed():
+    for key, speed in runpy_menu.SPEEDS.items():
+        command = runpy_menu.build_train_command(speed, "symmetric", f"{key}-x")
+        assert "--no_plot" not in command, f"speed {key} would skip the loss curve"
 
 
 def test_build_train_command_only_adds_max_steps_when_set():
@@ -219,20 +228,49 @@ def test_report_and_evaluate_commands_are_shaped_correctly():
 # --------------------------------------------------------------------------- #
 def test_my_config_round_trip(tmp_path: Path):
     path = tmp_path / "my_config.py"
-    settings = {
-        "speed": "long",
-        "bias": "attn-bQbV",
-        "epochs": 3,
-        "optimizer": "adamw",
-        "log_dir": "results",
-        "auto_report": False,
+    flags = {
+        "--model": "long",
+        "--bias_preset": "attn-bQbV",
+        "--epochs": 3,
+        "--optimizer": "adamw",
+        "--log_dir": "results",
     }
-    runpy_menu.write_my_config(settings, path)
+    runpy_menu.write_my_config(flags, path)
     text = path.read_text(encoding="utf-8")
-    for key in ("SPEED", "BIAS", "EPOCHS", "OPTIMIZER", "LOG_DIR", "AUTO_REPORT"):
-        assert key in text, f"{key} missing from the generated control panel"
-    assert "中文" not in text or True  # comments are present; content checked by decode
-    assert runpy_menu.read_my_config(path) == settings
+    assert "FORMAT = 2" in text
+    assert "SETTINGS" in text
+    assert "EXTRA_ARGS" in text
+    # The panel must document every knob the training script accepts, so a user
+    # can find anything rather than being limited to a hand-picked subset.
+    assert "--noise_density" in text
+    assert "--prelu_slope_mean" in text
+    assert "--no_apply_encoder" in text
+
+    panel = runpy_menu.read_my_config(path)
+    assert panel is not None
+    for flag, value in flags.items():
+        assert panel["flags"][flag] == value
+    assert panel["extra"] == []
+    assert sorted(runpy_menu.flags_to_argv(panel["flags"])) == sorted(
+        runpy_menu.flags_to_argv(flags)
+    )
+
+
+def test_my_config_honours_extra_args(tmp_path: Path):
+    path = tmp_path / "my_config.py"
+    runpy_menu.write_my_config({"--model": "tiny"}, path, extra=["--seed", "7"])
+    panel = runpy_menu.read_my_config(path)
+    assert panel["extra"] == ["--seed", "7"]
+
+
+def test_control_panel_is_not_overwritten(tmp_path: Path, monkeypatch):
+    """A hand-tuned panel must survive a later menu run."""
+    target = tmp_path / "my_config.py"
+    runpy_menu.write_my_config({"--model": "base"}, target)
+    before = target.read_text(encoding="utf-8")
+    monkeypatch.setattr(runpy_menu, "MY_CONFIG", target)
+    runpy_menu.maybe_write_panel({"--model": "tiny"})
+    assert target.read_text(encoding="utf-8") == before
 
 
 def test_read_my_config_survives_a_broken_file(tmp_path: Path):

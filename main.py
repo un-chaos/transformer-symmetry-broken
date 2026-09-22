@@ -8,9 +8,11 @@ Every experiment is a subcommand; the actual implementations live in
 
 Commands
 --------
+``download-data`` download a corpus (default: FineWeb-Edu 10B sample, resumable)
 ``train``         train an encoder-decoder Transformer
 ``evaluate``      score a checkpoint: validation/test loss and corpus BLEU
 ``analyze-bias``  measure how much the symmetry-breaking bias actually matters
+``report``        compare every finished run in a directory: one figure + a table
 ``plot``          draw the training curve for a finished run
 
 Usage Examples:
@@ -26,9 +28,16 @@ Usage Examples:
     # offline smoke test: no network, well under a minute
     python main.py train --model smoke --dataset_preset synthetic-reverse --max_steps 60
 
+    # the large monolingual corpus: download it, then train on it (denoising)
+    python main.py download-data --status
+    python main.py download-data
+    python main.py train --model small --dataset_preset fineweb-10b --objective denoising \
+        --fineweb_dir data/fineweb-edu/sample-10BT --bpe_vocab_size 32000 --max_steps 2000
+
     # score and analyse a finished run
     python main.py evaluate     --ckpt runs/small-egd-bgaussian-seed42/model_best.pt --split test
     python main.py analyze-bias --ckpt runs/small-egd-bgaussian-seed42/model_best.pt
+    python main.py report       --log_dir runs
     python main.py plot         --run  runs/small-egd-bgaussian-seed42
 
 Any arguments after the subcommand are passed straight through, so
@@ -49,6 +58,7 @@ from symbreak_transformer import __version__  # noqa: E402
 
 #: subcommand -> script implementing it
 COMMANDS = {
+    "download-data": "scripts/download_data.py",
     "train": "scripts/train.py",
     "evaluate": "scripts/evaluate.py",
     "analyze-bias": "scripts/analyze_bias.py",
@@ -57,6 +67,7 @@ COMMANDS = {
 }
 
 _DESCRIPTIONS = {
+    "download-data": "download a corpus (default: FineWeb-Edu 10B sample)",
     "train": "train an encoder-decoder Transformer",
     "evaluate": "score a checkpoint (loss + corpus BLEU)",
     "analyze-bias": "measure the effect of the symmetry-breaking bias",

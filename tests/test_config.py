@@ -13,6 +13,7 @@ from symbreak_transformer.config import (
     BIAS_MODES,
     DATASET_PRESETS,
     PRESETS,
+    TOKENIZER_MODES,
     BiasConfig,
     BiasPresets,
     DataConfig,
@@ -178,8 +179,14 @@ def test_validation_catches_bad_bias_settings():
 def test_validation_catches_bad_data_settings():
     with pytest.raises(ValueError, match="source"):
         DataConfig(source="ftp").validate()
+    # ``bpe`` is a valid mode (the FineWeb/denoising path needs it); anything
+    # outside ``TOKENIZER_MODES`` must still be rejected.
+    for mode in TOKENIZER_MODES:
+        DataConfig(tokenizer=mode).validate()
     with pytest.raises(ValueError, match="tokenizer"):
-        DataConfig(tokenizer="bpe").validate()
+        DataConfig(tokenizer="nope").validate()
+    with pytest.raises(ValueError, match="objective"):
+        DataConfig(objective="summarise").validate()
     with pytest.raises(ValueError, match="synthetic_task"):
         DataConfig(synthetic_task="shuffle").validate()
     with pytest.raises(ValueError, match="min_freq"):

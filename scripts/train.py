@@ -84,8 +84,19 @@ from symbreak_transformer.data import (  # noqa: E402
     load_all_splits,
 )
 from symbreak_transformer.evaluate import evaluate_bleu, evaluate_loss  # noqa: E402
+from symbreak_transformer.data.bpe import build_bpe_tokenizer  # noqa: E402
+from symbreak_transformer.data.denoising import (  # noqa: E402
+    build_denoising_dataloaders,
+)
+from symbreak_transformer.model_summary import model_summary, write_model_summary  # noqa: E402
 from symbreak_transformer.model import Seq2SeqTransformer  # noqa: E402
 from symbreak_transformer.optimizer import build_optimizer as _build_optimizer  # noqa: E402
+from symbreak_transformer.option_map import (  # noqa: E402
+    BIAS_FIELD_TO_DEST,
+    DATA_FIELD_TO_DEST,
+    MODEL_FIELD_TO_DEST,
+    field_overrides,
+)
 from symbreak_transformer.utils import (  # noqa: E402
     CSVLogger,
     StepWatchdog,
@@ -497,7 +508,14 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--use_prelu", action="store_true", default=S,
                    help="shorthand for --activation prelu")
     g.add_argument("--prelu_random_init", action="store_true", default=S)
+    g.add_argument("--prelu_slope_mean", type=float, default=S,
+                   help="mean of the random PReLU slopes (--prelu_random_init)")
+    g.add_argument("--prelu_slope_std", type=float, default=S,
+                   help="std of the random PReLU slopes (--prelu_random_init)")
     g.add_argument("--norm_first", action="store_true", default=S)
+    g.add_argument("--no_scaled_residual_init", action="store_false",
+                   dest="scaled_residual_init", default=S,
+                   help="disable the (2*n_layer)**-0.5 residual-output init scaling")
     g.add_argument("--no_scale_embedding", action="store_false", dest="scale_embedding",
                    default=S, help="do not scale the embedding by sqrt(n_embd)")
     g.add_argument("--no_tie_output_embedding", action="store_false",
@@ -531,6 +549,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--attn_mode", choices=["zero", "gaussian", "const"], default=S)
     g.add_argument("--attn_resample", choices=["fixed", "per_step"], default=S)
     g.add_argument("--attn_learnable", action="store_true", default=S)
+    g.add_argument("--attn_const", type=float, default=S,
+                   help="value used by attn_mode=const")
     g.add_argument("--mean_Q", type=float, default=S)
     g.add_argument("--std_Q", type=float, default=S)
     g.add_argument("--mean_K", type=float, default=S)
@@ -543,27 +563,64 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--no_share_across_layers", action="store_false",
                    dest="share_across_layers", default=S,
                    help="give every layer its own bias object")
-    g.add_argument("--bias_seed", type=int, default=S, help="dedicated bias RNG seed")
+    g.add_argument("--no_apply_encoder", action="store_false", dest="apply_encoder",
+                   default=S, help="no per-head bias in the encoder self-attention")
+    g.add_argument("--no_apply_decoder_self", action="store_false",
+                   dest="apply_decoder_self", default=S,
+                   help="no per-head bias in the decoder self-attention")
+    g.add_argument("--no_apply_decoder_cross", action="store_false",
+                   dest="apply_decoder_cross", default=S,
+                   help="no per-head bias in the decoder cross-attention")
+    g.add_argument("--bias_seed", type=int, default=S,
+                   help="RNG seed of the embedding bias b")
+    g.add_argument("--attn_seed", type=int, default=S,
+                   help="RNG seed of the per-head attention biases")
 
     # --- data -------------------------------------------------------------- #
     g = ap.add_argument_group("data")
-    g.add_argument("--dataset", choices=["hf", "synthetic", "local"], default=S,
-                   help="where the parallel text comes from")
+    g.add_argument("--dataset", choices=["hf", "synthetic", "local", "fineweb"],
+                   default=S, help="where the text comes from")
     g.add_argument("--dataset_preset", choices=sorted(DATASET_PRESETS), default=S)
+    g.add_argument("--objective", choices=["translation", "denoising"], default=S,
+                   help="translation needs parallel text; denoising trains the "
+                        "encoder-decoder on raw monolingual text")
     g.add_argument("--data_dir", type=str, default=S)
     g.add_argument("--hf_repo", type=str, default=S)
     g.add_argument("--hf_endpoint", type=str, default=S)
+    g.add_argument("--user_agent", type=str, default=S,
+                   help="the mirror answers 403 without a User-Agent header")
+    g.add_argument("--download_timeout", type=float, default=S)
     g.add_argument("--src_field", type=str, default=S)
     g.add_argument("--tgt_field", type=str, default=S)
     g.add_argument("--max_train_samples", type=int, default=S, help="0 = no limit")
     g.add_argument("--max_val_samples", type=int, default=S, help="0 = no limit")
+    g.add_argument("--local_src_col", type=int, default=S)
+    g.add_argument("--local_tgt_col", type=int, default=S)
     g.add_argument("--synthetic_task", choices=["copy", "reverse", "sort"], default=S)
     g.add_argument("--synthetic_train_size", type=int, default=S)
     g.add_argument("--synthetic_val_size", type=int, default=S)
     g.add_argument("--synthetic_test_size", type=int, default=S)
     g.add_argument("--synthetic_vocab", type=int, default=S)
     g.add_argument("--synthetic_len", type=int, default=S)
-    g.add_argument("--tokenizer", choices=["word", "char"], default=S)
+    g.add_argument("--synthetic_seed", type=int, default=S)
+    # --- the large monolingual corpus (source=fineweb) ---
+    g.add_argument("--fineweb_dir", type=str, default=S,
+                   help="directory holding the downloaded parquet shards")
+    g.add_argument("--text_column", type=str, default=S,
+                   help="the text column inside the shards")
+    g.add_argument("--max_documents", type=int, default=S,
+                   help="cap on documents read from the corpus (0 = all)")
+    g.add_argument("--val_every", type=int, default=S,
+                   help="every N-th document is held out for validation")
+    g.add_argument("--noise_density", type=float, default=S,
+                   help="fraction of tokens the denoising objective removes")
+    g.add_argument("--mean_span_length", type=float, default=S,
+                   help="average length of a removed span")
+    g.add_argument("--bpe_vocab_size", type=int, default=S,
+                   help="vocabulary size of the trained BPE tokenizer")
+    g.add_argument("--tokenizer_train_documents", type=int, default=S,
+                   help="documents used to fit the BPE tokenizer")
+    g.add_argument("--tokenizer", choices=["word", "char", "bpe"], default=S)
     g.add_argument("--min_freq", type=int, default=S)
     g.add_argument("--max_vocab", type=int, default=S)
     g.add_argument("--no_lowercase", action="store_false", dest="lowercase", default=S)
@@ -657,17 +714,10 @@ def data_config_from_args(args) -> DataConfig:
         kwargs.update(preset)
     if "dataset" in namespace:
         kwargs["source"] = namespace["dataset"]
-    # Everything a flag exists for; the rest of DataConfig keeps its default.
-    flag_fields = (
-        "max_train_samples", "max_val_samples", "data_dir", "hf_repo",
-        "hf_endpoint", "src_field", "tgt_field", "synthetic_task",
-        "synthetic_train_size", "synthetic_val_size", "synthetic_test_size",
-        "synthetic_vocab", "synthetic_len", "tokenizer", "min_freq", "max_vocab",
-        "lowercase", "max_src_len", "max_tgt_len", "fallback_to_synthetic",
-    )
-    for field in flag_fields:
-        if field in namespace:
-            kwargs[field] = namespace[field]
+    # Everything a flag exists for, taken from the single mapping table; the rest
+    # of DataConfig keeps its default.  Table-driven so a new data knob cannot be
+    # silently unreachable (see symbreak_transformer/option_map.py).
+    kwargs.update(field_overrides(DATA_FIELD_TO_DEST, namespace))
     return DataConfig(**kwargs).validate()
 
 
@@ -712,23 +762,23 @@ def clip_lengths(data_cfg: DataConfig, context_length: int) -> DataConfig:
 
 
 def model_config_from_args(args, src_vocab_size: int, tgt_vocab_size: int):
-    """Build the validated :class:`Seq2SeqConfig` from the model-shape flags."""
+    """Build the validated :class:`Seq2SeqConfig` from the model-shape flags.
+
+    Table-driven (see ``symbreak_transformer/option_map.py``), so every field of
+    ``Seq2SeqConfig`` is reachable from the command line and a new field cannot
+    silently become unconfigurable.
+    """
     namespace = vars(args)
-    overrides = {
-        key: namespace[key]
-        for key in (
-            "n_embd", "n_head", "n_encoder_layer", "n_decoder_layer", "d_ff",
-            "dropout", "attention_dropout", "activation", "prelu_random_init",
-            "norm_first", "scale_embedding", "tie_output_embedding",
-            "share_embeddings", "init_std",
-        )
-        if key in namespace
-    }
+    overrides = field_overrides(MODEL_FIELD_TO_DEST, namespace)
+    # ``context_length`` is passed explicitly below (resolve_config takes it as a
+    # named argument), so it must not also arrive through **overrides.
+    context_length = overrides.pop("context_length", None)
     if namespace.get("use_prelu"):
+        # Convenience shorthand for --activation prelu.
         overrides["activation"] = "prelu"
     return resolve_config(
         namespace["model"],
-        context_length=namespace.get("ctx"),
+        context_length=context_length,
         src_vocab_size=src_vocab_size,
         tgt_vocab_size=tgt_vocab_size,
         **overrides,
@@ -782,35 +832,9 @@ def bias_config_from_args(args) -> BiasConfig:
     namespace = vars(args)
     if namespace.get("symmetric"):
         return BiasConfig().validate()
-
-    field_for_flag = {
-        "bias_mode": "embed_mode",
-        "bias_mean": "embed_mean",
-        "bias_std": "embed_std",
-        "bias_const": "embed_const_value",
-        "bias_resample": "embed_resample",
-        "bias_learnable": "embed_learnable",
-        "attn_mode": "attn_mode",
-        "attn_resample": "attn_resample",
-        "attn_learnable": "attn_learnable",
-        "use_q_bias": "use_q_bias",
-        "use_k_bias": "use_k_bias",
-        "use_v_bias": "use_v_bias",
-        "mean_Q": "mean_Q",
-        "std_Q": "std_Q",
-        "mean_K": "mean_K",
-        "std_K": "std_K",
-        "mean_V": "mean_V",
-        "std_V": "std_V",
-        "share_across_heads": "share_across_heads",
-        "share_across_layers": "share_across_layers",
-        "bias_seed": "embed_seed",
-    }
-    overrides = {
-        field: namespace[flag]
-        for flag, field in field_for_flag.items()
-        if flag in namespace
-    }
+    # Table-driven so a newly added bias knob cannot be forgotten here; see
+    # symbreak_transformer/option_map.py.
+    overrides = field_overrides(BIAS_FIELD_TO_DEST, namespace)
     return resolve_bias_config(namespace.get("bias_preset"), **overrides)
 
 
@@ -853,32 +877,61 @@ def main() -> None:
 
     # ---------------- config ---------------- #
     data_cfg = data_config_from_args(args)
+    objective = data_cfg.objective
 
-    print("[data] loading parallel text ...")
-    splits_needed = ["train", "val"]
-    pairs = load_all_splits(data_cfg, splits_needed + ["test"])
-    train_pairs = pairs.get("train") or []
-    if not train_pairs:
-        raise SystemExit(
-            "the training split is empty; check --dataset / --data_dir / --hf_repo"
+    if objective == "denoising":
+        # Monolingual corpus (e.g. FineWeb-Edu): the encoder sees a span-corrupted
+        # document and the decoder reconstructs the removed spans.  There are no
+        # translations, so there is no BLEU either -- `test_pairs` stays empty.
+        print("[data] preparing the denoising corpus ...")
+        tokenizer = build_bpe_tokenizer(data_cfg)
+        src_tokenizer = tgt_tokenizer = tokenizer
+        pairs: Dict[str, Any] = {}
+        test_pairs: List[Any] = []
+        print(
+            f"[data] source={data_cfg.source} objective=denoising tokenizer=bpe "
+            f"vocab={tokenizer.vocab_size} sentinels={tokenizer.num_sentinels} "
+            f"noise_density={data_cfg.noise_density} "
+            f"mean_span_length={data_cfg.mean_span_length}"
         )
-    test_pairs = pairs.get("test") or []
-    print(
-        f"[data] source={data_cfg.source} train={len(train_pairs)} "
-        f"val={len(pairs.get('val') or [])} test={len(test_pairs)}"
-    )
+        cfg = model_config_from_args(
+            args, tokenizer.vocab_size, tokenizer.vocab_size
+        )
+        bias_cfg = bias_config_from_args(args)
+        clip_lengths(data_cfg, cfg.context_length)
+        print(
+            f"[data] clip_src={data_cfg.max_src_len} clip_tgt={data_cfg.max_tgt_len} "
+            f"max_documents={data_cfg.max_documents or 'all'} "
+            f"val_every={data_cfg.val_every}"
+        )
+    else:
+        print("[data] loading parallel text ...")
+        splits_needed = ["train", "val"]
+        pairs = load_all_splits(data_cfg, splits_needed + ["test"])
+        train_pairs = pairs.get("train") or []
+        if not train_pairs:
+            raise SystemExit(
+                "the training split is empty; check --dataset / --data_dir / --hf_repo"
+            )
+        test_pairs = pairs.get("test") or []
+        print(
+            f"[data] source={data_cfg.source} train={len(train_pairs)} "
+            f"val={len(pairs.get('val') or [])} test={len(test_pairs)}"
+        )
 
-    src_tokenizer, tgt_tokenizer = build_tokenizers(data_cfg, {"train": train_pairs})
-    cfg = model_config_from_args(args, src_tokenizer.vocab_size, tgt_tokenizer.vocab_size)
-    bias_cfg = bias_config_from_args(args)
-    # The data loader cannot see the model config, so "0 = context length" is
-    # resolved here, before anything is batched (see clip_lengths).
-    clip_lengths(data_cfg, cfg.context_length)
-    print(
-        f"[data] tokenizer={data_cfg.tokenizer} src_vocab={src_tokenizer.vocab_size} "
-        f"tgt_vocab={tgt_tokenizer.vocab_size} "
-        f"clip_src={data_cfg.max_src_len} clip_tgt={data_cfg.max_tgt_len}"
-    )
+        src_tokenizer, tgt_tokenizer = build_tokenizers(data_cfg, {"train": train_pairs})
+        cfg = model_config_from_args(
+            args, src_tokenizer.vocab_size, tgt_tokenizer.vocab_size
+        )
+        bias_cfg = bias_config_from_args(args)
+        # The data loader cannot see the model config, so "0 = context length" is
+        # resolved here, before anything is batched (see clip_lengths).
+        clip_lengths(data_cfg, cfg.context_length)
+        print(
+            f"[data] tokenizer={data_cfg.tokenizer} src_vocab={src_tokenizer.vocab_size} "
+            f"tgt_vocab={tgt_tokenizer.vocab_size} "
+            f"clip_src={data_cfg.max_src_len} clip_tgt={data_cfg.max_tgt_len}"
+        )
 
     # ---------------- run directory ---------------- #
     name = namespace.get("name") or run_name_for(args.model, args.optimizer, bias_cfg, seed)
@@ -892,6 +945,11 @@ def main() -> None:
     print(f"  model       : {args.model} (n_embd={cfg.n_embd} n_head={cfg.n_head} "
           f"enc/dec={cfg.n_encoder_layer}/{cfg.n_decoder_layer} d_ff={cfg.d_ff} "
           f"ctx={cfg.context_length})")
+    print(f"  data        : source={data_cfg.source} objective={objective} "
+          f"tokenizer={data_cfg.tokenizer} "
+          f"vocab={src_tokenizer.vocab_size}"
+          + (f" (shared)" if src_tokenizer is tgt_tokenizer else
+             f"/{tgt_tokenizer.vocab_size}"))
     print(f"  activation  : {cfg.activation} (prelu_random_init={cfg.prelu_random_init})")
     print(f"  norm_first  : {cfg.norm_first} | dropout={cfg.dropout} "
           f"attention_dropout={cfg.attention_dropout}")
@@ -912,15 +970,26 @@ def main() -> None:
     tgt_tokenizer.save(run_dir / "tokenizer_tgt.json")
 
     # ---------------- data ---------------- #
-    loaders = build_dataloaders(
-        data_cfg,
-        src_tokenizer,
-        tgt_tokenizer,
-        splits=["train", "val"],
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        seed=seed,
-    )
+    if objective == "denoising":
+        loaders = build_denoising_dataloaders(
+            data_cfg,
+            src_tokenizer,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            seed=seed,
+            max_src_len=data_cfg.max_src_len,
+            max_tgt_len=data_cfg.max_tgt_len,
+        )
+    else:
+        loaders = build_dataloaders(
+            data_cfg,
+            src_tokenizer,
+            tgt_tokenizer,
+            splits=["train", "val"],
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            seed=seed,
+        )
     train_loader = loaders["train"]
     val_loader = loaders.get("val")
 
@@ -936,6 +1005,12 @@ def main() -> None:
     ).to(device)
     n_params = count_parameters(model)
     print(f"[model] {n_params:,} trainable parameters on {device}")
+    # The full structure/dimension/parameter report: printed here so a run tells
+    # you what it built, and saved next to the checkpoints for later reference.
+    print("")
+    print(model_summary(model))
+    write_model_summary(model, run_dir / "model_summary.txt")
+    print("")
 
     # ---------------- optimizer ---------------- #
     if args.optimizer == "egd":

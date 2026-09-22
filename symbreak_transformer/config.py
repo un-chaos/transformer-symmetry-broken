@@ -24,10 +24,17 @@ BIAS_MODES = ("zero", "gaussian", "const")
 #: ``fixed`` draws once at init, ``per_step`` redraws on every optimizer step.
 RESAMPLE_MODES = ("fixed", "per_step")
 ACTIVATIONS = ("gelu", "relu", "prelu")
-#: Where the parallel text comes from.
-DATA_SOURCES = ("hf", "synthetic", "local")
+#: Where the text comes from.
+DATA_SOURCES = ("hf", "synthetic", "local", "fineweb")
 SYNTHETIC_TASKS = ("copy", "reverse", "sort")
-TOKENIZER_MODES = ("word", "char")
+TOKENIZER_MODES = ("word", "char", "bpe")
+#: How a corpus becomes encoder/decoder training pairs.
+#:
+#: ``translation`` needs a *parallel* corpus (Multi30k): source and target are two
+#: languages.  ``denoising`` needs only raw *monolingual* text (FineWeb-Edu): the
+#: encoder reads a span-corrupted copy and the decoder reconstructs the removed
+#: spans, which is how an encoder-decoder is trained on a 10B-token web corpus.
+OBJECTIVES = ("translation", "denoising")
 
 
 # --------------------------------------------------------------------------- #
@@ -44,6 +51,8 @@ class DataConfig:
 
     source: str = "hf"
     data_dir: str = "data"
+    #: ``translation`` (needs parallel text) or ``denoising`` (needs only raw text).
+    objective: str = "translation"
 
     # --- source == "hf" ---
     hf_repo: str = "bentrevett/multi30k"
@@ -80,6 +89,24 @@ class DataConfig:
     synthetic_len: int = 8
     synthetic_seed: int = 1234
 
+    # --- source == "fineweb": a large monolingual corpus of parquet shards ---
+    #: Directory holding the shards.  ``python main.py download-data`` fills it.
+    fineweb_dir: str = "data/fineweb-edu/sample-10BT"
+    #: The column holding the document text.
+    text_column: str = "text"
+    #: 0 means "read everything"; a cap makes a quick trial run possible.
+    max_documents: int = 0
+    #: A monolingual corpus has no val split, so every N-th document is held out.
+    val_every: int = 1000
+    #: Fraction of tokens the denoising objective removes (T5 uses 0.15).
+    noise_density: float = 0.15
+    #: Average length of a removed span (T5 uses 3).
+    mean_span_length: float = 3.0
+    #: Vocabulary size used when training a `bpe` tokenizer on the corpus.
+    bpe_vocab_size: int = 32000
+    #: Documents used to train the bpe tokenizer (0 = derive from ``max_documents``).
+    tokenizer_train_documents: int = 20000
+
     # --- tokenizer ---
     tokenizer: str = "word"
     lowercase: bool = True
@@ -94,6 +121,25 @@ class DataConfig:
             raise ValueError(
                 f"data source must be one of {DATA_SOURCES}, got {self.source!r}"
             )
+        if self.objective not in OBJECTIVES:
+            raise ValueError(
+                f"objective must be one of {OBJECTIVES}, got {self.objective!r}"
+            )
+        if self.objective == "denoising" and self.source == "hf":
+            # A parallel corpus is not what denoising wants, and a monolingual
+            # one cannot be used for translation: catch the mismatch up front.
+            raise ValueError(
+                "objective='denoising' needs raw text; use source='fineweb' (or "
+                "'local'/'synthetic'). objective='translation' needs parallel text."
+            )
+        if not 0.0 < self.noise_density < 1.0:
+            raise ValueError(
+                f"noise_density must be in (0, 1), got {self.noise_density}"
+            )
+        if self.mean_span_length < 1.0:
+            raise ValueError("mean_span_length must be >= 1")
+        if self.bpe_vocab_size < 100:
+            raise ValueError("bpe_vocab_size must be >= 100")
         if self.tokenizer not in TOKENIZER_MODES:
             raise ValueError(
                 f"tokenizer must be one of {TOKENIZER_MODES}, got {self.tokenizer!r}"
@@ -434,6 +480,30 @@ DATASET_PRESETS: Dict[str, Dict[str, Any]] = {
     "synthetic-copy": {"source": "synthetic", "synthetic_task": "copy"},
     "synthetic-reverse": {"source": "synthetic", "synthetic_task": "reverse"},
     "synthetic-sort": {"source": "synthetic", "synthetic_task": "sort"},
+    # --- the large monolingual corpus (needs `main.py download-data` first) ---
+    #: FineWeb-Edu sample/10BT: ~10B tokens, 14 parquet shards, ~28.5 GB.  Trained
+    #: with the denoising objective, because the corpus has no translations.
+    "fineweb-10b": {
+        "source": "fineweb",
+        "objective": "denoising",
+        "tokenizer": "bpe",
+        "fineweb_dir": "data/fineweb-edu/sample-10BT",
+        "bpe_vocab_size": 32000,
+        "noise_density": 0.15,
+        "mean_span_length": 3.0,
+    },
+    #: The same corpus, capped: enough to see the pipeline work in minutes.
+    "fineweb-quick": {
+        "source": "fineweb",
+        "objective": "denoising",
+        "tokenizer": "bpe",
+        "fineweb_dir": "data/fineweb-edu/sample-10BT",
+        "max_documents": 20000,
+        "bpe_vocab_size": 8000,
+        "tokenizer_train_documents": 5000,
+        "noise_density": 0.15,
+        "mean_span_length": 3.0,
+    },
 }
 
 
@@ -530,6 +600,7 @@ __all__ = [
     "DATA_SOURCES",
     "SYNTHETIC_TASKS",
     "TOKENIZER_MODES",
+    "OBJECTIVES",
     "Seq2SeqConfig",
     "BiasConfig",
     "DataConfig",
