@@ -782,11 +782,19 @@ def action_help() -> None:
     egd_lr / egd_F0 —— EGD 的两个关键超参，是配套的：lr 乘在动量上，
     (loss - F0) 除在动量上。把 F0 改小就要把 lr 相应调大。
 
+  模型信息：
+      每次训练一开始都会打印一份「模型说明书」，并同时存成
+      runs\\<名字>\\model_summary.txt —— 里面写明结构（几层/多宽/几个头）、
+      每一部分各有多少参数、参数主要花在哪、以及哪些张量是「不训练」的
+      缓冲区（本项目的偏置 b 就在里面）。想知道模型到底多大，看这个文件。
+
   结果怎么看：
-      每次训练都会存 runs\\<名字>\\：日志 CSV、模型权重、以及 training_curve.png
-      （损失曲线图）。跑完自动生成 runs\\_compare\\compare.png 把所有实验叠在
-      一张图上对比，还有 compare.txt（中文表格 + 结论）。验证损失越低越好，
-      BLEU 越高越好。如果几条曲线几乎重合，说明差别是噪声 —— 试着训练更久、
+      每次训练都会存 runs\\<名字>\\：损失曲线图 training_curve.png、模型说明书
+      model_summary.txt、每步日志 training_log.csv、这次的设置 config.json /
+      bias.json / args.json、以及模型权重。跑完自动生成
+      runs\\_compare\\compare.png 把所有实验叠在一张图上对比，还有
+      compare.txt（中文表格 + 结论）。验证损失越低越好，BLEU 越高越好。
+      如果几条曲线几乎重合，说明差别是噪声 —— 试着训练更久、
       换更大模型或更多数据。
 """)
 
