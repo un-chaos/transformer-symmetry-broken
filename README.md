@@ -21,14 +21,24 @@
 - `model_summary.txt` —— 模型说明书：结构、维度、参数量花在哪
 - `training_log.csv` / `config.json` / `bias.json` / `args.json` / 模型权重
 
-**想自由调初始参数**（模型大小、学习率、batch size、数据集……）：选菜单 `3`，
+**想自由调初始参数**（模型档位、结构、学习率、batch size、数据集……）：选菜单 `3`，
 它会列出当前设置，输入编号就能改 —— **没有任何参数是写死的**，
 `train.py` 支持多少参数（100 多项）就能改多少，选 `a` 看全部。
+里面还有两个专门的子界面：
+
+- **`m` 模型结构**：直接按参数量选档位（`4m` / `10m` / `25m` / `50m` / `124m`），
+  或者自己填宽度、层数、头数、前馈宽度、上下文长度；界面顶部**一直显示
+  当前大约多少参数**，改完立刻更新。
+- **`b` 对称性破缺**：b 的生成方式、**常数 b 的值**（自己输入）、高斯标准差、
+  随机种子、加在 Q/K/V 哪一层、是否可学习……
+
 改过的项会被自动记住，不需要编辑任何文件。
 
-**想用大规模语料**（FineWeb-Edu 10B，约 28.5 GB）：选菜单 `8` 下载
-（断点续传，会另开一个窗口显示进度），然后在菜单 `3` 里把 `--dataset_preset`
-改成 `fineweb-10b`（或先试 `fineweb-quick`）。
+**大规模语料**（FineWeb-Edu 10B，约 28.5 GB）**本地已经下好了**：
+菜单第 8 项会直接显示「已就绪，训练直接使用」，训练会读
+`data\fineweb-edu\sample-10BT\` —— **不会再下载一遍**，也不会联网核对
+（只有你主动要求、或本地确实缺分片时才会）。想用它训练：菜单 `3` 把
+`--dataset_preset` 改成 `fineweb-10b`（或先试 `fineweb-quick`）。
 
 **没有第二个入口、没有要手改的配置文件、不需要懂代码。**
 
@@ -68,18 +78,65 @@ double-click run.bat          # or: python run.py   (identical)
 numbered Chinese menu  →  answer with digits  →  results land in runs/
 ```
 
-Every capability is a menu item: training (1, 2), free configuration of any
-parameter (3, 4), re-reporting finished runs (5), measuring what the bias actually
-does (6), the results folder (7), downloading the large corpus (8) and help (9). There is no second entry point —
+Every capability is a menu item: training (1, 2), free configuration (3, 4),
+re-reporting finished runs (5), measuring what the bias actually does (6), the
+results folder (7), the corpus (8) and help (9). There is no second entry point —
 no dispatcher script, no shell-script archive, no config file to hand-edit — and
 `tests/test_cli.py::test_the_menu_is_the_only_root_entry_point` fails if one is
 reintroduced.
 
 Parameters are *not* hard-coded behind the menu: menu item 3) edits every flag
-`scripts/train.py` accepts (~128 of them, listed straight from its argparse), and
-remembers the edits in a generated `run_settings.json` the user never opens. The
-internal scripts under `scripts/` are implementation detail, invoked by the menu
+`scripts/train.py` accepts (~128 of them, listed straight from its argparse) --
+including the model shape via a dedicated `m` screen and the symmetry-breaking
+bias via a `b` screen -- and remembers the edits in a generated
+`run_settings.json` the user never opens. The menu also shows the resulting model
+size while you edit it (see "Model size is an axis you can choose"). The internal
+scripts under `scripts/` are implementation detail, invoked by the menu
 for isolation (a crash returns to the menu rather than killing it).
+
+### Model size is an axis you can choose
+
+Two things were missing from the first version of the menu: you could not tell how
+big a model you were choosing, and the shape parameters were buried under "all
+parameters". Both are fixed:
+
+* `symbreak_transformer/config.py` gains `MODEL_TIERS`, a parameter-count ladder
+  (`4m`, `10m`, `25m`, `50m`, `124m`) alongside the named presets. The names are
+  targets; the menu always prints the *computed* size next to each choice.
+* `run.py` estimates the parameter count arithmetically (`estimate_parameters`), so
+  the menu can show it **without importing torch** (the menu stays instant). A test
+  asserts the estimate equals what `Seq2SeqTransformer` really builds, for every
+  preset.
+* Because embeddings dominate the total, the estimate follows the vocabulary the
+  chosen dataset will build (`--bpe_vocab_size`, or the preset's, or 32000), and
+  the screens say which vocabulary they assumed. The same `4m` architecture is
+  ≈4.3M at a 32000-token vocabulary and ≈1.2M at 8000.
+* The structure screen (`m`) exposes width, heads, encoder/decoder depth,
+  feed-forward width, context length, dropout and activation, each with a one-line
+  explanation, and keeps a live "current ≈ N parameters" line at the top.
+
+### The bias, including a hand-typed constant b
+
+The `b` screen exposes the whole symmetry-breaking surface in plain language:
+generation mode (`zero` / `gaussian` / `const`), **the constant's value**
+(`--bias_const`, typed directly), the gaussian mean/std, the resampling policy,
+the random seed, whether `b` is learnable, and the per-head attention biases
+(`bQ` / `bK` / `bV`, their mode, constant, mean/std and seeds). `--bias_const` and
+`--bias_std` are also on the main settings screen. The effect is checkable from the
+run itself: `bias.json` records the value and `training_log.csv`'s `embed_b_norm`
+equals `value * sqrt(n_embd)`.
+
+### The local corpus is used, not re-fetched
+
+The FineWeb-Edu shards are already on this machine, so the menu reads the disk
+first and says so: item 8 renders as "已就绪（14 个分片 / 28.5 GB），训练直接使用".
+`corpus_status()` only reads the local manifest and the shard listing -- **no
+network call** -- and item 8 returns immediately when the corpus is complete
+(opt-in re-verification is offered, defaulting to no). `--status` in
+`scripts/download_data.py` is offline-first for the same reason; it used to contact
+the mirror on every menu visit, which is exactly the "why is it downloading
+again?" complaint. `--verify` forces the remote check. Training never triggered a
+download: it reads `--fineweb_dir` directly.
 
 ## Key Idea
 
@@ -195,8 +252,11 @@ Both happen from the menu:
 
 ### What is available
 
-Menu **3)** → `a)` prints every parameter `scripts/train.py` accepts, grouped,
-with its default and its help text. Menu **9)** explains what each menu item does.
+Menu **3)** lists the common settings; `m)` opens the model structure (with the live
+parameter estimate), `b)` opens the symmetry-breaking bias (including a hand-typed
+`--bias_const`), and `a)` prints every parameter `scripts/train.py` accepts,
+grouped, with its default and its help text. Menu **9)** explains what each menu
+item does.
 The preset tables (model sizes, bias presets, dataset presets and their parameter
 counts) are printed by the training script's `--list_models`, which the menu does
 not need to expose because the same names are offered as numbered choices in the
@@ -317,7 +377,7 @@ will not load).
   ├── run_settings.json           # generated: what the menu remembers for you (gitignored)
   ├── 使用说明.md                  # plain-language Chinese guide
   ├── symbreak_transformer/
-  │   ├── config.py               # Seq2SeqConfig + PRESETS, BiasConfig + BiasPresets, DataConfig
+  │   ├── config.py               # Seq2SeqConfig + PRESETS + MODEL_TIERS (4m…124m), BiasConfig + BiasPresets, DataConfig
   │   ├── optimizer.py            # EGD (energy-conserving descent), AdamW/SGDM builders
   │   ├── utils.py                # device, seeding, CSV logging, stall watchdog, optimizer reporting
   │   ├── evaluate.py             # validation loss, greedy decoding, corpus BLEU
@@ -470,22 +530,24 @@ The default task is `bentrevett/multi30k`, German → English image captions
 ### Large-scale corpus: FineWeb-Edu 10B
 
 `HuggingFaceFW/fineweb-edu`, config `sample/10BT` — roughly **10 B tokens in 14
-parquet shards (~28.5 GB)**. Menu item **8)** fetches it through a separate,
-**resumable** downloader in a **separate, visible console window**, so progress
-(or a stall) is observable rather than hidden behind the menu; re-running it
-continues where it stopped instead of starting over, and it first reports how much
-is already on disk. The destination defaults to
-`data/fineweb-edu/sample-10BT`.
+parquet shards (~28.5 GB)**. It is **already on this machine** in
+`data/fineweb-edu/sample-10BT`, and the menu uses it as-is: item **8)** renders as
+"已就绪（14 个分片 / 28.5 GB），训练直接使用" and returns without touching the
+network. If the shards are ever missing or incomplete, the same item offers the
+**resumable** downloader (in a separate, visible console window so a stall is
+observable); it continues where it stopped and never re-fetches a complete shard.
+`python scripts/download_data.py --status` reports disk state offline-first;
+`--verify` additionally asks the remote.
 
 FineWeb-Edu is **monolingual English**, so it cannot be used for translation. It
 is used with the span-corruption (T5-style denoising) objective instead, which
 needs no parallel data. Select it from the menu: item **3)** → set
 `--dataset_preset` to `fineweb-quick` (a 20 000-document slice, for a first try)
-or `fineweb-10b` (everything), optionally adjust `--bpe_vocab_size`,
-`--tokenizer_train_documents`, `--max_documents` and bound the run with
-`--max_steps` — then run 1) or 2). Choosing a `fineweb-*` preset selects the
-denoising objective automatically, because that is the only objective the corpus
-supports.
+or `fineweb-10b` (everything) — the menu shows how big the model will be with that
+vocabulary — optionally adjust `--bpe_vocab_size`, `--tokenizer_train_documents`,
+`--max_documents` and bound the run with `--max_steps`, then run 1) or 2).
+Choosing a `fineweb-*` preset selects the denoising objective automatically,
+because that is the only objective the corpus supports.
 
 Under `--objective denoising` the encoder reads a document with a few spans
 replaced by `<extra_id_k>` sentinels and the decoder writes those spans back, so
@@ -507,14 +569,15 @@ indexed. Validation documents are held out deterministically by `--val_every`.
 python -m pytest tests -q
 ```
 
-246 tests, ~3 minutes on CPU. They cover the bias semantics (each mode,
+266 tests, ~2 minutes on CPU. They cover the bias semantics (each mode,
 resampling, learnable, per-sector independence), attention mask polarity and
 padding invariance, causality, weight tying, the EGD dynamics (`F0` floor,
 initialisation, checkpoint round trip), the tokenizer and collate contract,
 hand-computed BLEU values, the model-summary invariants (component rows sum to
 the distinct-parameter total, tied tensors reported once), the FineWeb/denoising
 path (BPE id layout, sentinel framing, span recovery, deterministic shuffling),
-the menu itself (scripted input, graceful EOF, settings persistence, and a guard
-that **no second entry point exists**), a guard that every `scripts/train.py`
-option is reachable from the menu's parameter editor, and full end-to-end training
-runs through the same scripts the menu spawns.
+the menu itself (scripted input, graceful EOF, settings persistence, corpus
+detection, and a guard that **no second entry point exists**), the parameter
+estimate (asserted equal to the real model for every preset) and the tier ladder,
+a guard that every `scripts/train.py` option is reachable from the menu's parameter
+editor, and full end-to-end training runs through the same scripts the menu spawns.

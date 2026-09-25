@@ -11,6 +11,12 @@ connections regularly and the shards are ~2 GB each.  Re-running the command
 simply continues; nothing is downloaded twice and a partial file is never thrown
 away.
 
+The corpus is normally fetched from the menu (item 8), and the menu only reaches
+this script when something is actually missing -- a complete corpus is detected
+from the local manifest and the downloader is not started at all.  ``--status``
+follows the same rule: it answers from disk first and only asks the remote when
+the local copy is incomplete (or when ``--verify`` is passed).
+
 Note that FineWeb-Edu is **monolingual English**, so it is used with the
 span-corruption (denoising) objective rather than translation -- see
 ``--dataset_preset fineweb-10b`` in ``scripts/train.py``.
@@ -22,8 +28,11 @@ Usage Examples:
     # only the first two shards (~4.3 GB), enough to try the pipeline
     python scripts/download_data.py --max_files 2
 
-    # how much is already on disk?
+    # how much is already on disk?  (offline when the corpus is complete)
     python scripts/download_data.py --status
+
+    # force the remote comparison even when the local copy looks complete
+    python scripts/download_data.py --status --verify
 
     # a different corpus / mirror
     python scripts/download_data.py --repo HuggingFaceFW/fineweb-edu \
@@ -86,6 +95,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="report what is on disk and what is still missing, then exit",
     )
+    ap.add_argument(
+        "--verify",
+        action="store_true",
+        help="with --status: always ask the remote, even when the corpus is complete",
+    )
     return ap
 
 
@@ -99,6 +113,21 @@ def show_status(args) -> int:
     print(f"[fineweb] size      : {on_disk / 1e9:.2f} GB")
     if manifest:
         print(f"[fineweb] manifest  : complete={manifest.get('complete')}")
+
+    # Already complete: say so and stop.  Reaching out to the remote here would
+    # be a pointless network round-trip on every menu visit (and it fails when
+    # offline), which is exactly the "why am I downloading again?" complaint.
+    listed = manifest.get("files") if isinstance(manifest, dict) else None
+    complete_locally = (
+        bool(manifest.get("complete"))
+        and isinstance(listed, list) and bool(listed)
+        and len(local) >= len(listed)
+    )
+    if complete_locally and not args.verify:
+        print("[fineweb] status    : complete -- nothing to download "
+              "(use --verify to re-check the remote)")
+        return 0
+
     try:
         remote = list_fineweb_files(args.repo, args.config, args.endpoint)
         expected = sum(int(item["size"]) for item in remote)

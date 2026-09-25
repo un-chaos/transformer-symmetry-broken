@@ -33,6 +33,16 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from symbreak_transformer.utils import configure_console_encoding  # noqa: E402
+from symbreak_transformer.config import (  # noqa: E402
+    DATASET_PRESETS,
+    MODEL_TIERS,
+    PRESETS,
+    REFERENCE_VOCAB,
+)
+from symbreak_transformer.data.fineweb import (  # noqa: E402
+    fineweb_local_files,
+    read_manifest,
+)
 
 SCRIPTS = ROOT / "scripts"
 TRAIN_SCRIPT = SCRIPTS / "train.py"
@@ -90,7 +100,7 @@ SPEEDS: dict = {
     },
     "4": {
         "key": "corpus",
-        "label": "大规模语料 —— FineWeb-Edu 10B（菜单 7 先下载；CPU 上很慢）",
+        "label": "大规模语料 —— FineWeb-Edu 10B（本地已就绪，直接用；CPU 上很慢）",
         "minutes": "取决于步数，建议先用菜单 3) 把「最多训练多少步」改小",
         "model": "tiny",
         "dataset_preset": "fineweb-quick",
@@ -127,21 +137,91 @@ _BIAS_TEXT = {
 COMMON_FLAGS: dict = {
     "--dataset_preset": "数据集：synthetic-*（玩具，不用联网）/ multi30k-*（翻译）/ fineweb-*（10B 语料）",
     "--objective": "任务类型：translation=翻译 / denoising=去噪（原始文本，不用翻译对照）",
-    "--model": "模型大小：smoke / tiny / small / base / large（越大越强、越慢）",
+    "--model": "模型档位：按参数量选（4m / 10m / 25m / 50m / 124m）或按预设选（smoke/tiny/small/base/large）",
+    "--n_embd": "隐藏维度（模型结构；调大就更大更慢）",
+    "--n_head": "注意力头数（模型结构；必须能整除隐藏维度）",
+    "--n_encoder_layer": "编码器层数（模型结构）",
+    "--n_decoder_layer": "解码器层数（模型结构）",
+    "--d_ff": "前馈网络宽度（模型结构，通常是隐藏维度的 4 倍）",
+    "--ctx": "上下文长度（一句话最多多少个 token）",
     "--bias_preset": "对称性破缺设置：symmetric / b-gaussian / b-const / attn-bQbV / attn-full / ...",
+    "--bias_const": "**常数 b 的值**（bias 模式选 const 时用；想自己定就改这里）",
+    "--bias_std": "高斯 b 的标准差（bias 模式选 gaussian 时用）",
+    "--bias_mean": "高斯 b 的均值（一般保持 0）",
     "--optimizer": "优化器：egd（本项目的能量守恒下降法）/ adamw / sgdm",
     "--egd_lr": "EGD 学习率（和 F0 配套，改一个通常要一起调）",
     "--egd_F0": "EGD 的 loss 偏移，必须低于能达到的最小 loss（默认 -1 对交叉熵永远安全）",
     "--batch_size": "每批多少条数据（内存不够就调小）",
     "--epochs": "训练几轮（越大越慢、一般也越好）",
     "--max_steps": "最多训练多少步（0 = 由轮数决定；快速试跑就写个小数字）",
-    "--ctx": "上下文长度（一句话最多多少个 token）",
-    "--n_embd": "隐藏维度（不写就用模型预设的值）",
-    "--n_head": "注意力头数（必须能整除隐藏维度）",
     "--seed": "随机种子（固定它，两次实验才有可比性）",
     "--log_dir": "结果保存到哪个文件夹",
     "--name": "这次实验的名字（留空 = 自动起名）",
 }
+
+#: 「模型结构」子界面（菜单 3 的 m）。
+STRUCTURE_FLAGS: tuple = (
+    "--model", "--n_embd", "--n_head", "--n_encoder_layer", "--n_decoder_layer",
+    "--d_ff", "--ctx", "--dropout", "--attention_dropout", "--activation",
+    "--share_embeddings", "--no_tie_output_embedding", "--init_std",
+)
+
+#: 「对称性破缺（bias）」子界面（菜单 3 的 b）。
+#: 顺序 = 从"最常见"到"最细节"，每一项都能直接输入数值。
+BIAS_FLAGS: tuple = (
+    "--bias_preset", "--bias_mode", "--bias_const", "--bias_std", "--bias_mean",
+    "--bias_resample", "--bias_learnable", "--use_q_bias", "--use_v_bias",
+    "--use_k_bias", "--attn_mode", "--attn_const", "--mean_Q", "--std_Q",
+    "--mean_V", "--std_V", "--attn_resample", "--attn_learnable",
+    "--bias_seed", "--attn_seed",
+)
+
+#: 「模型结构」子界面的中文说明（菜单 3 的 m）。参数量估算假设这个词表大小。
+STRUCTURE_NOTES: dict = {
+    "--model": "档位：直接按参数量选（4m/10m/25m/50m/124m），或按预设选（smoke…large）",
+    "--n_embd": "隐藏维度：模型有多宽。调大 → 参数变多、变慢、一般更强",
+    "--n_head": "注意力头数：必须能整除隐藏维度（比如 512 配 8 个头，每头 64 维）",
+    "--n_encoder_layer": "编码器层数（读输入的那半边）",
+    "--n_decoder_layer": "解码器层数（写输出的那半边）",
+    "--d_ff": "前馈网络宽度：一般取隐藏维度的 4 倍",
+    "--ctx": "上下文长度：一句话最多多少个 token（影响位置编码表大小）",
+    "--dropout": "dropout 比例：0 = 不丢；数据少时调大一点防过拟合",
+    "--attention_dropout": "注意力内部的 dropout 比例",
+    "--activation": "激活函数：gelu / relu / prelu",
+    "--share_embeddings": "源语言和目标语言共用一份词嵌入（词表必须一样大）",
+    "--no_tie_output_embedding": "输出层不再和词嵌入共享权重（参数会变多）",
+    "--init_std": "权重初始化标准差",
+}
+
+#: 「对称性破缺（bias）」子界面的中文说明（菜单 3 的 b）。
+BIAS_NOTES: dict = {
+    "--bias_preset": "一键方案：symmetric（不破缺）/ b-gaussian（随机 b）/ b-const（常数 b）/ "
+                     "attn-bQbV（注意力里的 bQ+bV）/ attn-full / b-learnable …",
+    "--bias_mode": "embedding 上 b 的生成方式：zero（全 0）/ gaussian（随机）/ const（常数）",
+    "--bias_const": "**常数 b 的值**：mode=const 时每个维度都加这个数（默认 1.0，想自己定就改这里）",
+    "--bias_std": "高斯 b 的标准差（默认 0.02，越大破缺越强）",
+    "--bias_mean": "高斯 b 的均值（一般保持 0）",
+    "--bias_resample": "b 是只在初始化时抽一次（fixed），还是每步重抽（per_step）",
+    "--bias_learnable": "让 b 变成可训练参数（默认是固定的缓冲区，不参与训练）",
+    "--use_q_bias": "在注意力的 Q 上再加一个偏置 bQ",
+    "--use_v_bias": "在注意力的 V 上再加一个偏置 bV",
+    "--use_k_bias": "在注意力的 K 上加偏置 bK（默认关：它会被 softmax 部分抵消）",
+    "--attn_mode": "注意力偏置的生成方式：zero / gaussian / const",
+    "--attn_const": "注意力偏置取常数时的值",
+    "--mean_Q": "bQ 的高斯均值（每个头一份）",
+    "--std_Q": "bQ 的高斯标准差（越大越强）",
+    "--mean_V": "bV 的高斯均值",
+    "--std_V": "bV 的高斯标准差",
+    "--attn_resample": "注意力偏置是抽一次还是每步重抽",
+    "--attn_learnable": "让注意力偏置变成可训练参数",
+    "--bias_seed": "b 的随机种子（换一个就得到另一个随机方向）",
+    "--attn_seed": "注意力偏置的随机种子",
+}
+
+#: 数据目录（脚本按项目根目录解析这个相对路径）。
+CORPUS_DIR = "data/fineweb-edu/sample-10BT"
+
+
 
 #: 不放进「改参数」界面的开关：纯信息性的，或者会破坏本项目的硬性要求。
 #: * ``--no_plot``：损失曲线必须落盘，不允许通过菜单关掉它；
@@ -477,6 +557,182 @@ def log_dir_path(log_dir: str = DEFAULT_LOG_DIR) -> Path:
     return path if path.is_absolute() else (ROOT / path)
 
 
+# ===================================================================== #
+#  语料：本地已经有了就直接用，绝不再下一次
+# ===================================================================== #
+def corpus_status(directory: str = CORPUS_DIR) -> dict:
+    """
+    看看本地语料到底在不在（**只读磁盘，不联网**）。
+
+    Returns:
+        ``{"dir": Path, "shards": int, "bytes": int, "complete": bool, "ready": bool}``
+
+    ``ready`` 为真表示"现在就能训练，不需要下载"：以清单里的 ``complete`` 为准；
+    清单缺失时退化成"分片数不为 0 就算就绪"，这样即使清单被删掉也不会逼着用户
+    重下一次。
+    """
+    path = Path(directory)
+    if not path.is_absolute():
+        path = ROOT / path
+    shards = fineweb_local_files(path) if path.is_dir() else []
+    total = sum(item.stat().st_size for item in shards)
+    manifest = read_manifest(path) if path.is_dir() else {}
+    listed = manifest.get("files") if isinstance(manifest, dict) else None
+    expected = len(listed) if isinstance(listed, list) and listed else 0
+    if expected:
+        complete = bool(manifest.get("complete")) and len(shards) >= expected
+    else:
+        complete = bool(shards)
+    return {
+        "dir": path,
+        "shards": len(shards),
+        "bytes": total,
+        "expected": expected,
+        "complete": complete,
+        "ready": bool(shards) and complete,
+    }
+
+
+def corpus_line(status: dict) -> str:
+    """一行中文说明，给菜单和训练前的确认用。"""
+    if status["ready"]:
+        return (f"语料已就绪：{status['shards']} 个分片 / "
+                f"{status['bytes'] / 1e9:.2f} GB（训练直接使用，不用下载）")
+    if status["shards"]:
+        return (f"语料不完整：{status['shards']}/{status['expected'] or '?'} 个分片 / "
+                f"{status['bytes'] / 1e9:.2f} GB（菜单 8 可以续传补齐）")
+    return "本地还没有语料（菜单 8 下载；玩具任务不需要语料）"
+
+
+def uses_fineweb(flags: dict) -> bool:
+    """这次的设置会不会读 FineWeb 语料？"""
+    preset = str(flags.get("--dataset_preset") or "")
+    if preset.startswith("fineweb"):
+        return True
+    if str(flags.get("--dataset") or "") == "fineweb":
+        return True
+    if str(flags.get("--objective") or "") == "denoising":
+        return True
+    return bool(flags.get("--fineweb_dir"))
+
+
+def corpus_dir_for(flags: dict) -> str:
+    """这次训练会读的语料目录（用户显式给过 --fineweb_dir 就用它）。"""
+    return str(flags.get("--fineweb_dir") or CORPUS_DIR)
+
+
+# ===================================================================== #
+#  模型规模估算（纯算术，不 import torch，所以菜单启动是秒开的）
+# ===================================================================== #
+def estimate_parameters(n_embd: int, n_head: int, enc: int, dec: int, d_ff: int,
+                        ctx: int, vocab: int = REFERENCE_VOCAB, *,
+                        tie_output: bool = True, share_embeddings: bool = False) -> int:
+    """
+    估算参数量。
+
+    和真实模型逐项对齐（``tests/test_run_and_report.py`` 拿真模型核对过）：
+    每侧的 embedding = ``vocab*n_embd + ctx*n_embd``；一层注意力 =
+    ``q/k/v/o`` 各 ``n_embd^2 + n_embd``；一层前馈 = 两个线性层；每个
+    LayerNorm = ``2*n_embd``；解码器多一组交叉注意力。不引入 torch 是为了让
+    菜单立刻能显示结果 —— 真值在训练开始时由 ``model_summary`` 打印。
+    """
+    emb = vocab * n_embd + ctx * n_embd
+    attn = 4 * (n_embd * n_embd + n_embd)
+    ff = 2 * (n_embd * d_ff) + d_ff + n_embd
+    ln = 2 * n_embd
+    enc_layer = attn + ff + 2 * ln
+    dec_layer = 2 * attn + ff + 3 * ln
+    out = 0 if tie_output else vocab * n_embd + vocab
+    sides = 1 if share_embeddings else 2
+    return sides * emb + enc * enc_layer + dec * dec_layer + out
+
+
+def structure_from(flags: dict) -> dict:
+    """把 ``--model`` + 结构覆盖项整理成 :func:`estimate_parameters` 的参数。"""
+    preset = PRESETS.get(str(flags.get("--model") or ""))
+    if preset is None:
+        preset = PRESETS["small"]
+    def pick(flag, fallback):
+        value = flags.get(flag)
+        return fallback if value is None else value
+    return {
+        "n_embd": int(pick("--n_embd", preset.n_embd)),
+        "n_head": int(pick("--n_head", preset.n_head)),
+        "enc": int(pick("--n_encoder_layer", preset.n_encoder_layer)),
+        "dec": int(pick("--n_decoder_layer", preset.n_decoder_layer)),
+        "d_ff": int(pick("--d_ff", preset.d_ff)),
+        "ctx": int(pick("--ctx", preset.context_length)),
+        "tie_output": not bool(flags.get("--no_tie_output_embedding")),
+        "share_embeddings": bool(flags.get("--share_embeddings")),
+    }
+
+
+def assumed_vocab(flags: dict) -> int:
+    """
+    估算参数量时假设的词表大小。
+
+    词表大小直接决定 embedding 占多少参数，所以能确定就用真的：
+    1. 用户显式写了 ``--bpe_vocab_size`` → 用它；
+    2. 数据集预设自带 BPE 词表大小（``fineweb-*``）→ 用它；
+    3. 否则用 :data:`REFERENCE_VOCAB`（和 ``--max_vocab`` 同一量级）。
+    """
+    explicit = flags.get("--bpe_vocab_size")
+    if explicit:
+        return int(explicit)
+    preset = DATASET_PRESETS.get(str(flags.get("--dataset_preset") or ""))
+    if isinstance(preset, dict) and preset.get("bpe_vocab_size"):
+        return int(preset["bpe_vocab_size"])
+    return REFERENCE_VOCAB
+
+
+def vocab_note(flags: dict) -> str:
+    """``按 32000 词表`` 这样的一句话，用在估算数字后面。"""
+    return f"按 {assumed_vocab(flags)} 词表"
+
+
+def estimate_for(flags: dict, vocab: int | None = None) -> int:
+    """当前设置大概是多少参数（词表大小见 :func:`assumed_vocab`）。"""
+    structure = structure_from(flags)
+    structure["vocab"] = assumed_vocab(flags) if vocab is None else int(vocab)
+    return estimate_parameters(**structure)
+
+
+def _millions(count: int) -> str:
+    """把参数量写成 ``4.3M`` / ``124.0M`` 这样好读的形式。"""
+    return f"{count / 1e6:.1f}M"
+
+
+def model_choice_labels(flags: dict | None = None) -> dict:
+    """
+    ``--model`` 的选项文字：每个档位都带上参数量，这样可以直接按大小选。
+
+    参数量按当前数据会用到的词表估算（见 :func:`assumed_vocab`），所以换数据集
+    时这里显示的数字也会跟着变 —— 那正是你实际会得到的规模。
+    """
+    vocab = assumed_vocab(flags if flags is not None else effective_flags())
+    labels: dict = {}
+    for index, name in enumerate(ordered_model_names(), start=1):
+        cfg = PRESETS[name]
+        count = estimate_parameters(
+            cfg.n_embd, cfg.n_head, cfg.n_encoder_layer, cfg.n_decoder_layer,
+            cfg.d_ff, cfg.context_length, vocab,
+        )
+        kind = "参数量档位" if name in MODEL_TIERS else "预设"
+        labels[str(index)] = f"{name:<7} ≈{_millions(count):>7} 参数   （{kind}）"
+    return labels
+
+
+def ordered_model_names() -> list:
+    """档位在前、老预设在后（菜单里就按这个顺序编号）。"""
+    return list(MODEL_TIERS) + [name for name in PRESETS if name not in MODEL_TIERS]
+
+
+def model_name_for_choice(key: str) -> str:
+    """把 :func:`model_choice_labels` 的编号换回档位名。"""
+    return ordered_model_names()[int(key) - 1]
+
+
+
 def open_folder(path: Path) -> None:
     """在文件管理器里打开结果文件夹（失败也不报错）。"""
     try:
@@ -514,9 +770,13 @@ def _row_text(flag: str, action) -> str:
     return f"{flag:<24} = {_render(value)}{star}"
 
 
-def _short_help(action) -> str:
-    text = (action.help or "").strip().replace("\n", " ")
-    return text[:70]
+def _short_help(action, flag: str | None = None) -> str:
+    """这一项是什么意思：优先用中文说明，没有就用 train.py 的英文帮助。"""
+    note = (STRUCTURE_NOTES.get(flag or "") or BIAS_NOTES.get(flag or "")
+            or COMMON_FLAGS.get(flag or ""))
+    if note:
+        return note
+    return (action.help or "").strip().replace("\n", " ")[:80]
 
 
 def _coerce(raw: str, action):
@@ -537,17 +797,28 @@ def ask_value(flag: str, action) -> None:
     开关类参数问 y/n；其余的自己输入值。
     """
     print()
-    print(f"  {flag}   {_short_help(action)}")
+    print(f"  {flag}   {_short_help(action, flag)}")
     print(f"  现在：{_render(effective_flags().get(flag))}   "
           f"（train.py 的默认值：{_render(default_of(action))}）")
 
     if action.choices:
         choices = list(action.choices)
-        labels = {str(i + 1): str(c) for i, c in enumerate(choices)}
-        key = ask("  选一个（回车 = 保持现在的）：", labels, default="")
-        if not key:
-            return
-        value = choices[int(key) - 1]
+        if flag == "--model":
+            # 档位是"按参数量选"的入口，所以选项里直接带上参数量。
+            print()
+            print(f"  （档位名字按 {REFERENCE_VOCAB} 词表命名；下面显示的是按你当前数据"
+                  f"（{vocab_note(effective_flags())}）算出的实际规模）")
+            key = ask("  选一个（回车 = 保持现在的）：",
+                      model_choice_labels(effective_flags()), default="")
+            if not key:
+                return
+            value = model_name_for_choice(key)
+        else:
+            labels = {str(i + 1): str(c) for i, c in enumerate(choices)}
+            key = ask("  选一个（回车 = 保持现在的）：", labels, default="")
+            if not key:
+                return
+            value = choices[int(key) - 1]
     elif _is_switch(action):
         want = yes_no("  要加上这个开关吗？", default=bool(CUSTOM.get(flag)))
         value = True if want else None
@@ -596,22 +867,69 @@ def _edit_all() -> None:
         ask_value(flag, action)
 
 
+def _edit_subset(flags: tuple, heading: str, note: str = "") -> None:
+    """
+    一个「只看这几项」的子界面（模型结构 / 对称性破缺），一样按编号改。
+
+    每一项下面都跟着一句中文说明 —— 这两个界面就是给"我想调但不知道调什么"用的。
+    """
+    index = _action_index()
+    rows = [(flag, index[flag]) for flag in flags if flag in index]
+    if not rows:
+        return
+    title(heading)
+    if note:
+        print(f"  {note}")
+    print("  带 ★ 的是你手动改过的项；输入编号改，直接回车返回。\n")
+    for position, (flag, action) in enumerate(rows, start=1):
+        print(f"  {position:>2}) {_row_text(flag, action)}")
+        text = _short_help(action, flag)
+        if text:
+            print(f"      {text}")
+    raw = input("\n改哪一项？（回车=返回）：").strip().lower()
+    if raw in ("", "0", "q"):
+        return
+    if raw.isdigit() and 1 <= int(raw) <= len(rows):
+        flag, action = rows[int(raw) - 1]
+        ask_value(flag, action)
+    else:
+        print(f"  没有 {raw!r} 这个选项。")
+
+
 def action_settings() -> None:
     """菜单 3)：修改训练设置。改过的项自动记住，不需要编辑任何文件。"""
     while True:
         title("修改训练设置")
         rows = _common_rows()
+        flags_now = effective_flags()
+        print(f"  当前模型规模：≈ {_millions(estimate_for(flags_now))} 参数"
+              f"（{vocab_note(flags_now)}估算；真实值训练一开始会打印）")
         print("  带 ★ 的是你手动改过的项，它们的优先级最高（回车进去可以恢复默认）。")
         print("  输入编号就能改；直接回车返回。")
         print()
         for index, (flag, action) in enumerate(rows, start=1):
             print(f"  {index:>2}) {_row_text(flag, action)}")
         print()
+        print("   m) 模型结构（档位 / 宽度 / 层数 / 头数 / 上下文长度）")
+        print("   b) 对称性破缺（bias 的详细设置，含「常数 b 的值」）")
         print("   a) 全部参数（train.py 支持的所有设置）")
         print("   d) 全部恢复默认")
         raw = input("\n改哪一项？（回车=返回）：").strip().lower()
-        if raw in ("", "0", "b", "q"):
+        if raw in ("", "0", "q"):
             return
+        if raw == "m":
+            _edit_subset(
+                STRUCTURE_FLAGS, "模型结构",
+                f"参数量{vocab_note(effective_flags())}估算：当前 ≈ "
+                f"{_millions(estimate_for(effective_flags()))}",
+            )
+            continue
+        if raw == "b":
+            _edit_subset(
+                BIAS_FLAGS, "对称性破缺（bias）",
+                "想看「常数 b」：把 --bias_mode 设成 const，再改 --bias_const 的值即可。",
+            )
+            continue
         if raw == "a":
             _edit_all()
             continue
@@ -633,8 +951,12 @@ def action_show_settings() -> None:
     flags = effective_flags()
     speed = current_speed()
     print(f"  数据      ：{speed['dataset_preset']}")
-    print(f"  模型大小  ：{speed['model']}")
+    print(f"  模型      ：{flags.get('--model')}（≈ {_millions(estimate_for(flags))} 参数，"
+          f"{vocab_note(flags)}）")
     print(f"  对称性破缺：{_BIAS_TEXT.get(STATE['bias'], STATE['bias'])}")
+    if str(flags.get("--objective") or "").startswith("denoising") or \
+            str(flags.get("--dataset_preset") or "").startswith("fineweb"):
+        print(f"  语料      ：{corpus_line(corpus_status(corpus_dir_for(flags)))}")
     print(f"  优化器    ：{STATE['optimizer']}")
     print(f"  预计耗时  ：{speed['minutes']}")
     print()
@@ -643,7 +965,7 @@ def action_show_settings() -> None:
         star = "  ★" if flag in CUSTOM else ""
         print(f"    {flag:<26} {_render(value)}{star}")
     print()
-    print("  想改就回菜单 3)。")
+    print("  想改就回菜单 3)（m = 模型结构，b = bias 详细设置）。")
 
 
 # ===================================================================== #
@@ -655,7 +977,11 @@ def describe(flags: dict) -> None:
     print("  接下来会这样做：")
     speed = current_speed()
     print(f"    数据      ：{flags.get('--dataset_preset')}（{speed['label'].split('——')[-1].strip()}）")
-    print(f"    模型大小  ：{flags.get('--model')}")
+    if uses_fineweb(flags):
+        # 语料是不是已经在本地，直接说清楚 —— 不需要用户再去下载一次。
+        print(f"    语料      ：{corpus_line(corpus_status(corpus_dir_for(flags)))}")
+    print(f"    模型      ：{flags.get('--model')}（≈ {_millions(estimate_for(flags))} 参数，"
+          f"{vocab_note(flags)}）")
     print(f"    对称性破缺：{_BIAS_TEXT.get(STATE['bias'], STATE['bias'])}")
     print(f"    训练轮数  ：{flags.get('--epochs')}")
     print(f"    优化器    ：{flags.get('--optimizer')}")
@@ -679,7 +1005,7 @@ def do_training(flags: dict, dry_run: bool = False, want_evaluate: bool = True) 
         print()
         print(f"  训练出错了（返回码 {code}）。常见原因：")
         print("    - 没连上网，下载不了数据（菜单 1) 的「玩具任务」不需要网络）")
-        print("    - 大语料还没下载完（回菜单 7) 可以下载 / 看进度）")
+        print("    - 大语料不完整（回菜单 8) 看状态 / 续传补齐）")
         print("    - 磁盘空间不够")
         print("  详细报错信息在上面的输出里。")
         return code
@@ -826,13 +1152,27 @@ def action_analyze_bias(dry_run: bool = False) -> None:
 
 
 def action_download(dry_run: bool = False) -> None:
-    """下载大规模语料（在新窗口里跑，方便看到进度）。"""
+    """
+    菜单 8)：语料。
+
+    **本地已经下好了就直接用** —— 先只看磁盘（不联网），只有确实缺东西
+    （或者用户明确要求核对）才会去下载/续传。
+    """
+    status = corpus_status()
     print()
-    print("  将下载 FineWeb-Edu sample/10BT（约 10B 词、14 个分片、约 28.5 GB）。")
-    print("  这是**断点续传**的：中途断了再跑一次就会接着下，不会重复下载。")
-    run_command(DOWNLOAD_SCRIPT, ["--status"])
-    if not yes_no("  现在开始下载吗？（会另开一个窗口显示进度）", default=True):
-        return
+    print(f"  语料目录：{status['dir']}")
+    print(f"  {corpus_line(status)}")
+    if status["ready"]:
+        print()
+        print("  训练会**直接读这个目录**，不需要再下一遍。")
+        if not yes_no("  要连网重新核对并补齐缺失的分片吗？（一般不用）", default=False):
+            return
+    else:
+        print()
+        print("  将下载 FineWeb-Edu sample/10BT（约 10B 词、14 个分片、约 28.5 GB）。")
+        print("  这是**断点续传**的：中途断了再跑一次就会接着下，不会重复下载。")
+        if not yes_no("  现在开始下载吗？（会另开一个窗口显示进度）", default=True):
+            return
     if dry_run:
         print("  （dry-run：不启动）")
         return
@@ -862,15 +1202,23 @@ def action_help() -> None:
     1) 三种 bias 做对比 —— 一次跑三次（b=0 / 高斯 / 常数），最后出对比图。
        第一次用就选这个，选「玩具任务」完全不用联网。
     2) 只跑一种 bias —— 想单独看某一种的时候用。
-    3) 修改训练设置 —— 模型大小、学习率、数据、任意超参都在这里改。
-       带 ★ 的是你改过的项；回车进去可以恢复默认。改过就自动记住。
-    4) 查看当前设置 —— 把这次真正会用到的参数原原本本列出来。
+    3) 修改训练设置。里面分三层：
+         常用项：数据集、模型档位、优化器、学习率、batch size、轮数、步数……
+         m) 模型结构：按参数量选档位（4m / 10m / 25m / 50m / 124m），
+            或者自己调宽度、层数、头数、前馈宽度、上下文长度。
+            界面顶部一直显示「当前 ≈ 多少参数」，改完立刻更新。
+         b) 对称性破缺（bias）：b 的生成方式、**常数 b 的值**、高斯的标准差、
+            随机种子、放在 Q/K/V 的哪一层、是否可学习……
+         a) 全部参数：train.py 支持的所有设置（100 多项）。
+       改过的项带 ★，程序会自动记住；回车进去可以恢复默认。
+    4) 查看当前设置 —— 把这次真正会用到的参数原样列出来。
     5) 看已有结果 —— 不重新训练，只把 runs\\ 里的结果重新画成对比图。
     6) 分析 bias —— 拿一个训练好的模型，把里面的 bias 去掉，看它的输出改变了
        多少。改变越大，说明这个 bias 对模型越重要；这是「对称性破缺到底有没有
        用」的量化答案。
     7) 打开结果文件夹。
-    8) 下载大规模语料（FineWeb-Edu 10B，约 28.5 GB，可断点续传）。
+    8) 大规模语料（FineWeb-Edu 10B）—— **本地已经有了就直接用，不会再下一遍**；
+       只有确实缺分片时才会去下载/续传。
     9) 这个帮助。
     0) 退出。
 
@@ -887,7 +1235,7 @@ def action_help() -> None:
       synthetic-*  程序自己生成的玩具任务：不用下载、不用联网，先跑通流程
       multi30k-*   翻译（translation）：平行语料，主指标是 BLEU
       fineweb-*    去噪（denoising）：10B 词英文网页语料，不需要翻译标注
-                   先回菜单 7) 下载
+                   本地已经下好了（菜单 8) 显示状态），训练直接使用
 
     egd_lr / egd_F0 —— EGD 的两个关键超参，是配套的：lr 乘在动量上，
     (loss - F0) 除在动量上。把 F0 改小就要把 lr 相应调大。
@@ -912,15 +1260,34 @@ def action_help() -> None:
 MENU = {
     "1": "开始训练：三种 bias 做对比（b=0 / 高斯 / 常数）   ← 第一次用选这个",
     "2": "开始训练：只跑一种 bias",
-    "3": "修改训练设置（模型大小 / 学习率 / 数据 / 全部参数）",
+    "3": "修改训练设置（模型档位 / 结构 / bias / 全部参数）",
     "4": "查看当前设置",
     "5": "看已有结果（重新出对比图和报告）",
     "6": "分析 bias 到底改变了什么（挑一个训练好的模型）",
     "7": "打开结果文件夹",
-    "8": "下载大规模语料（FineWeb-Edu 10B，约 28.5 GB，可断点续传）",
+    "8": "大规模语料（FineWeb-Edu 10B）",
     "9": "帮助：每个选项是什么意思",
     "0": "退出",
 }
+
+
+def menu_items() -> dict:
+    """
+    菜单文字。第 8 项会根据**本地语料**的实际情况改写：
+
+    已经下好了就直说"已就绪、训练直接用"，用户不会以为还要再下一遍。
+    """
+    items = dict(MENU)
+    status = corpus_status()
+    if status["ready"]:
+        items["8"] = (f"大规模语料：已就绪（{status['shards']} 个分片 / "
+                      f"{status['bytes'] / 1e9:.1f} GB），训练直接使用")
+    elif status["shards"]:
+        items["8"] = (f"大规模语料：不完整（{status['shards']}/"
+                      f"{status['expected'] or '?'} 个分片），可续传补齐")
+    else:
+        items["8"] = "下载大规模语料（FineWeb-Edu 10B，约 28.5 GB，可断点续传）"
+    return items
 
 
 def welcome() -> None:
@@ -946,7 +1313,7 @@ def main() -> int:
     while True:
         try:
             print()
-            for key, text in MENU.items():
+            for key, text in menu_items().items():
                 print(f"  {key}) {text}")
             choice = input("\n请输入数字后回车：").strip()
 

@@ -277,9 +277,9 @@ def test_the_menu_scripts_all_exist():
 def test_the_menu_numbers_every_feature():
     """Renumbering the menu is fine; losing an item off the end is not."""
     assert set(runpy_menu.MENU) == {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9"}
-    labels = " ".join(runpy_menu.MENU.values())
+    labels = " ".join(runpy_menu.menu_items().values())
     for feature in ("三种 bias", "只跑一种", "修改训练设置", "当前设置",
-                    "已有结果", "分析 bias", "结果文件夹", "下载", "帮助"):
+                    "已有结果", "分析 bias", "结果文件夹", "语料", "帮助"):
         assert feature in labels, f"the menu no longer offers: {feature}"
 
 
@@ -330,6 +330,263 @@ def test_analyze_on_an_empty_runs_directory_says_so(tmp_path, capsys, monkeypatc
     monkeypatch.setattr(runpy_menu, "finished_runs", lambda log_dir="runs": [])
     runpy_menu.action_analyze_bias()
     assert "还没有训练好的模型" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# run.py: the local corpus is reused, never re-downloaded
+# --------------------------------------------------------------------------- #
+def test_corpus_status_reads_the_disk(tmp_path: Path):
+    """A complete manifest plus its shards means "ready"; no network involved."""
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "a.parquet").write_bytes(b"x" * 10)
+    (corpus / "b.parquet").write_bytes(b"y" * 20)
+    status = runpy_menu.corpus_status(str(corpus))
+    assert status["shards"] == 2
+    assert status["bytes"] == 30
+    # No manifest at all: shards on disk are still good enough to train on.
+    assert status["ready"] is True
+
+    (corpus / "manifest.json").write_text(
+        json.dumps({"complete": True, "files": [{"path": "a"}, {"path": "b"}]}),
+        encoding="utf-8",
+    )
+    assert runpy_menu.corpus_status(str(corpus))["ready"] is True
+
+
+def test_corpus_status_reports_an_incomplete_corpus(tmp_path: Path):
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "a.parquet").write_bytes(b"x")
+    (corpus / "manifest.json").write_text(
+        json.dumps({"complete": False, "files": [{"path": "a"}, {"path": "b"}]}),
+        encoding="utf-8",
+    )
+    status = runpy_menu.corpus_status(str(corpus))
+    assert status["ready"] is False
+    assert "不完整" in runpy_menu.corpus_line(status)
+
+
+def test_corpus_status_on_an_empty_directory(tmp_path: Path):
+    status = runpy_menu.corpus_status(str(tmp_path / "nothing"))
+    assert status["ready"] is False
+    assert "还没有语料" in runpy_menu.corpus_line(status)
+
+
+def test_the_committed_corpus_is_detected_as_ready():
+    """The point of this change: the corpus on this machine is used as-is."""
+    status = runpy_menu.corpus_status()
+    if not status["shards"]:  # pragma: no cover - a clone without the corpus
+        pytest.skip("the FineWeb corpus is not present in this checkout")
+    assert status["ready"] is True, runpy_menu.corpus_line(status)
+    assert "已就绪" in runpy_menu.corpus_line(status)
+
+
+def test_menu_item_8_says_ready_instead_of_offering_a_download():
+    """The menu itself must stop implying that the corpus needs downloading."""
+    items = runpy_menu.menu_items()
+    status = runpy_menu.corpus_status()
+    if status["ready"]:
+        assert "已就绪" in items["8"]
+        assert "下载" not in items["8"]
+    else:  # pragma: no cover - depends on the machine
+        assert "下载" in items["8"] or "不完整" in items["8"]
+
+
+def test_a_ready_corpus_is_not_downloaded(monkeypatch, capsys):
+    """Choosing item 8 with a complete corpus must not spawn the downloader."""
+    started = []
+
+    def fake_popen(*args, **kwargs):  # pragma: no cover - must not run
+        started.append(args)
+        raise AssertionError("the downloader must not be started")
+
+    monkeypatch.setattr(runpy_menu.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "n")  # "no, do not verify"
+    runpy_menu.action_download()
+    output = capsys.readouterr().out
+    assert not started, "a complete corpus triggered a download"
+    assert "已就绪" in output
+    assert "不需要再下一遍" in output
+
+
+def test_downloading_is_still_offered_when_the_corpus_is_missing(monkeypatch, capsys):
+    """The opposite case must keep working: an empty corpus offers a download."""
+    monkeypatch.setattr(
+        runpy_menu, "corpus_status",
+        lambda directory=runpy_menu.CORPUS_DIR: {
+            "dir": Path("nowhere"), "shards": 0, "bytes": 0, "expected": 0,
+            "complete": False, "ready": False,
+        },
+    )
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "n")  # decline to download
+    runpy_menu.action_download()
+    output = capsys.readouterr().out
+    assert "还没有语料" in output
+    assert "断点续传" in output
+
+
+def test_uses_fineweb_detects_the_corpus_datasets():
+    assert runpy_menu.uses_fineweb({"--dataset_preset": "fineweb-10b"})
+    assert runpy_menu.uses_fineweb({"--dataset_preset": "fineweb-quick"})
+    assert runpy_menu.uses_fineweb({"--objective": "denoising"})
+    assert runpy_menu.uses_fineweb({"--fineweb_dir": "somewhere"})
+    assert not runpy_menu.uses_fineweb({"--dataset_preset": "multi30k-quick"})
+    assert not runpy_menu.uses_fineweb({"--dataset_preset": "synthetic-copy"})
+
+
+# --------------------------------------------------------------------------- #
+# run.py: model structure is adjustable and the size is visible
+# --------------------------------------------------------------------------- #
+def test_the_parameter_estimate_matches_the_real_model():
+    """The arithmetic estimate must agree with what torch actually builds.
+
+    A wrong estimate would be worse than none: this is the number the menu shows
+    while the user picks a tier.
+    """
+    from symbreak_transformer.config import Seq2SeqConfig, resolve_bias_config
+
+    torch_model = pytest.importorskip("symbreak_transformer.model")
+    for name, cfg in PRESETS.items():
+        real = torch_model.Seq2SeqTransformer(
+            Seq2SeqConfig(
+                n_embd=cfg.n_embd, n_head=cfg.n_head,
+                n_encoder_layer=cfg.n_encoder_layer,
+                n_decoder_layer=cfg.n_decoder_layer, d_ff=cfg.d_ff,
+                context_length=cfg.context_length,
+                src_vocab_size=runpy_menu.REFERENCE_VOCAB,
+                tgt_vocab_size=runpy_menu.REFERENCE_VOCAB,
+                tie_output_embedding=True,
+            ),
+            resolve_bias_config("symmetric"),
+        )
+        real_total = sum(p.numel() for p in real.parameters())
+        estimate = runpy_menu.estimate_parameters(
+            cfg.n_embd, cfg.n_head, cfg.n_encoder_layer, cfg.n_decoder_layer,
+            cfg.d_ff, cfg.context_length, runpy_menu.REFERENCE_VOCAB,
+        )
+        assert estimate == real_total, f"{name}: estimate {estimate} != real {real_total}"
+
+
+def test_parameter_tiers_exist_and_are_ordered():
+    """The ladder the user picks from: 4m ... 124m, each bigger than the last."""
+    from symbreak_transformer.config import MODEL_TIERS
+
+    assert list(MODEL_TIERS) == ["4m", "10m", "25m", "50m", "124m"]
+    sizes = [
+        runpy_menu.estimate_parameters(
+            cfg.n_embd, cfg.n_head, cfg.n_encoder_layer, cfg.n_decoder_layer,
+            cfg.d_ff, cfg.context_length, runpy_menu.REFERENCE_VOCAB,
+        )
+        for cfg in MODEL_TIERS.values()
+    ]
+    assert sizes == sorted(sizes), f"the tiers are not monotone: {sizes}"
+    # Each tier should land within 25% of its name at the reference vocabulary.
+    for (name, _), size in zip(MODEL_TIERS.items(), sizes):
+        target = float(name.rstrip("m")) * 1e6
+        assert abs(size - target) / target < 0.25, f"{name} is really {size / 1e6:.1f}M"
+
+
+def test_the_model_choices_show_parameter_counts():
+    """Selecting by parameter count is the whole point, so the counts are shown."""
+    labels = runpy_menu.model_choice_labels({"--dataset_preset": "synthetic-copy"})
+    assert set(labels) == {str(i) for i in range(1, len(labels) + 1)}
+    joined = " ".join(labels.values())
+    assert "参数" in joined
+    assert "124m" in joined and "参数量档位" in joined
+    # The number next to a tier matches the standalone estimate.
+    from symbreak_transformer.config import MODEL_TIERS
+    cfg = MODEL_TIERS["124m"]
+    expected = runpy_menu._millions(runpy_menu.estimate_parameters(
+        cfg.n_embd, cfg.n_head, cfg.n_encoder_layer, cfg.n_decoder_layer,
+        cfg.d_ff, cfg.context_length, runpy_menu.REFERENCE_VOCAB,
+    ))
+    assert expected in joined
+
+
+def test_every_model_choice_maps_back_to_its_name():
+    labels = runpy_menu.model_choice_labels({"--dataset_preset": "synthetic-copy"})
+    for key in labels:
+        name = runpy_menu.model_name_for_choice(key)
+        assert name in PRESETS
+        assert name in labels[key]
+
+
+def test_structure_flags_are_editable_in_the_structure_screen():
+    """The structure screen must expose the shape, not just the preset name."""
+    index = runpy_menu._action_index(runpy_menu.train_parser())
+    for flag in ("--model", "--n_embd", "--n_head", "--n_encoder_layer",
+                 "--n_decoder_layer", "--d_ff", "--ctx"):
+        assert flag in runpy_menu.STRUCTURE_FLAGS, f"{flag} is not in the structure screen"
+        assert flag in index, f"{flag} is not a real training flag"
+
+
+def test_editing_the_structure_changes_the_estimated_size(isolated_menu_state):
+    """A manual width/深度 change must move the number the menu shows."""
+    before = runpy_menu.estimate_for(runpy_menu.effective_flags())
+    runpy_menu.CUSTOM.update({
+        "--n_embd": 512, "--n_head": 8, "--n_encoder_layer": 12,
+        "--n_decoder_layer": 12, "--d_ff": 2048, "--ctx": 512,
+    })
+    after = runpy_menu.estimate_for(runpy_menu.effective_flags())
+    assert after > before * 10
+    assert runpy_menu._millions(after) == "121.6M"
+
+
+def test_the_assumed_vocabulary_follows_the_dataset():
+    """Embeddings dominate, so the count must reflect the vocabulary in play."""
+    small = runpy_menu.assumed_vocab({"--dataset_preset": "fineweb-quick"})
+    large = runpy_menu.assumed_vocab({"--dataset_preset": "fineweb-10b"})
+    assert small == 8000 and large == 32000
+    # An explicit size wins over the preset.
+    assert runpy_menu.assumed_vocab(
+        {"--dataset_preset": "fineweb-quick", "--bpe_vocab_size": 2000}
+    ) == 2000
+
+
+# --------------------------------------------------------------------------- #
+# run.py: the constant b is a first-class, hand-typeable value
+# --------------------------------------------------------------------------- #
+def test_bias_const_is_on_the_common_screen():
+    assert "--bias_const" in runpy_menu.COMMON_FLAGS
+    assert "--bias_std" in runpy_menu.COMMON_FLAGS
+
+
+def test_the_bias_screen_exposes_the_constant_and_the_rest():
+    for flag in ("--bias_mode", "--bias_const", "--bias_std", "--bias_mean",
+                 "--bias_seed", "--bias_learnable", "--attn_const"):
+        assert flag in runpy_menu.BIAS_FLAGS, f"{flag} is missing from the bias screen"
+
+
+def test_a_hand_typed_constant_b_reaches_the_command(isolated_menu_state, monkeypatch):
+    """Typing a value for --bias_const must put it in the training command."""
+    answers = iter(["2.5"])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(answers))
+    runpy_menu.ask_value("--bias_const", runpy_menu._action_index()["--bias_const"])
+    assert runpy_menu.CUSTOM["--bias_const"] == 2.5
+
+    argv = runpy_menu.build_train_command(runpy_menu.effective_flags())
+    assert argv[argv.index("--bias_const") + 1] == "2.5"
+
+
+def test_choosing_the_const_bias_mode_then_the_value(isolated_menu_state, monkeypatch):
+    """The documented two-step: mode=const, then the value."""
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "3")  # 3rd choice = const
+    runpy_menu.ask_value("--bias_mode", runpy_menu._action_index()["--bias_mode"])
+    assert runpy_menu.CUSTOM["--bias_mode"] == "const"
+
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "0.5")
+    runpy_menu.ask_value("--bias_const", runpy_menu._action_index()["--bias_const"])
+
+    argv = runpy_menu.build_train_command(runpy_menu.effective_flags())
+    assert argv[argv.index("--bias_mode") + 1] == "const"
+    assert argv[argv.index("--bias_const") + 1] == "0.5"
+
+
+def test_the_const_bias_flag_is_a_float():
+    """A non-numeric value must be rejected rather than passed to argparse."""
+    action = runpy_menu._action_index()["--bias_const"]
+    assert runpy_menu._coerce("1.25", action) == 1.25
 
 
 # --------------------------------------------------------------------------- #

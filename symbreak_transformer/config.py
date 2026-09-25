@@ -426,6 +426,47 @@ PRESETS: Dict[str, Seq2SeqConfig] = {
     ),
 }
 
+#: Parameter-count tiers: the same architectures as above, but named after how
+#: big they actually are, which is the axis a user can reason about.  Each name is
+#: the *target* size; the true total depends on the vocabulary, so the numbers
+#: below are quoted for :data:`REFERENCE_VOCAB` (32000, the project's default BPE
+#: size for the FineWeb path) and the menu prints the exact count next to every
+#: choice.  They are not aliases -- they are separate entries on the ladder, placed
+#: so the ladder is evenly spaced (4 / 10 / 25 / 50 / 124 M).
+MODEL_TIERS: Dict[str, Seq2SeqConfig] = {
+    # 4.3 M at the reference vocabulary -- the smallest thing that still trains.
+    "4m": Seq2SeqConfig(
+        context_length=16, n_encoder_layer=2, n_decoder_layer=2,
+        n_head=4, n_embd=64, d_ff=128, dropout=0.1,
+    ),
+    # 10.1 M
+    "10m": Seq2SeqConfig(
+        context_length=256, n_encoder_layer=4, n_decoder_layer=4,
+        n_head=4, n_embd=128, d_ff=512, dropout=0.1,
+    ),
+    # 25.7 M
+    "25m": Seq2SeqConfig(
+        context_length=256, n_encoder_layer=5, n_decoder_layer=5,
+        n_head=8, n_embd=256, d_ff=1024, dropout=0.1,
+    ),
+    # 49.8 M
+    "50m": Seq2SeqConfig(
+        context_length=512, n_encoder_layer=6, n_decoder_layer=6,
+        n_head=8, n_embd=384, d_ff=1536, dropout=0.1,
+    ),
+    # 121.6 M -- measured, not guessed; the largest that fits this CPU box.
+    "124m": Seq2SeqConfig(
+        context_length=512, n_encoder_layer=12, n_decoder_layer=12,
+        n_head=8, n_embd=512, d_ff=2048, dropout=0.1,
+    ),
+}
+PRESETS.update(MODEL_TIERS)
+
+#: Vocabulary the parameter counts in this module (and in the menu) are quoted
+#: for.  A word-level run over Multi30k builds a much smaller vocabulary, so its
+#: real totals are lower; ``--list_models --vocab N`` recomputes them.
+REFERENCE_VOCAB = 32000
+
 #: Named symmetry-breaking settings.  Pick one with ``--bias_preset`` and
 #: override any single field with the matching flag.
 BiasPresets: Dict[str, BiasConfig] = {
@@ -575,7 +616,19 @@ def resolve_bias_config(
 def preset_table() -> str:
     """Human-readable listing of every preset, for ``--list_models``."""
     lines = ["model presets (--model):"]
+    lines.append("  -- named sizes ------------------------------------------------")
     for name, cfg in PRESETS.items():
+        if name in MODEL_TIERS:
+            continue
+        lines.append(
+            f"  {name:<8} n_embd={cfg.n_embd:<4} n_head={cfg.n_head:<3} "
+            f"enc/dec={cfg.n_encoder_layer}/{cfg.n_decoder_layer} "
+            f"d_ff={cfg.d_ff:<5} context_length={cfg.context_length}"
+        )
+    lines.append(
+        f"  -- parameter-count tiers (counts at a {REFERENCE_VOCAB}-token vocab) ----"
+    )
+    for name, cfg in MODEL_TIERS.items():
         lines.append(
             f"  {name:<8} n_embd={cfg.n_embd:<4} n_head={cfg.n_head:<3} "
             f"enc/dec={cfg.n_encoder_layer}/{cfg.n_decoder_layer} "
@@ -605,6 +658,8 @@ __all__ = [
     "BiasConfig",
     "DataConfig",
     "PRESETS",
+    "MODEL_TIERS",
+    "REFERENCE_VOCAB",
     "BiasPresets",
     "DATASET_PRESETS",
     "get_preset",
