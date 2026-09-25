@@ -243,6 +243,25 @@ def test_report_and_evaluate_commands_are_shaped_correctly():
     assert "--ckpt" in evaluate_command
 
 
+def test_log_paths_are_root_relative(tmp_path: Path, monkeypatch):
+    """Starting the menu from another directory must not misreport where results go.
+
+    Regression guard: the run directory used to be resolved against the *current*
+    working directory, so launching ``python D:\\...\\run.py`` from elsewhere
+    printed (and later opened) a path in the wrong place, even though training
+    wrote into the project.
+    """
+    monkeypatch.chdir(tmp_path)
+    assert runpy_menu.log_dir_path() == runpy_menu.ROOT / "runs"
+    assert runpy_menu.log_dir_path("myruns") == runpy_menu.ROOT / "myruns"
+    # An absolute path is taken as given.
+    absolute = tmp_path / "elsewhere"
+    assert runpy_menu.log_dir_path(str(absolute)) == absolute
+
+    # And the finished-run scan follows the same rule.
+    assert runpy_menu.DEFAULT_LOG_DIR in str(runpy_menu.log_dir_path())
+
+
 def test_the_menu_scripts_all_exist():
     """Every script the menu shells out to must be present and named right."""
     for script in (

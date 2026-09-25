@@ -465,6 +465,18 @@ def run_command(script: Path, args: list, dry_run: bool = False) -> int:
     return subprocess.call(argv, cwd=str(ROOT))
 
 
+def log_dir_path(log_dir: str = DEFAULT_LOG_DIR) -> Path:
+    """
+    结果目录的**绝对**路径。
+
+    相对路径按项目根目录解释，而不是"当前所在目录" —— 否则从别处启动
+    （例如 ``python D:\\...\\run.py``）时，屏幕上打印的路径和打开的文件夹
+    会是错的，而训练其实写在项目目录里。双击 run.bat 时两者本来就相同。
+    """
+    path = Path(log_dir)
+    return path if path.is_absolute() else (ROOT / path)
+
+
 def open_folder(path: Path) -> None:
     """在文件管理器里打开结果文件夹（失败也不报错）。"""
     try:
@@ -650,7 +662,7 @@ def describe(flags: dict) -> None:
     if CUSTOM:
         print(f"    你手改过的：{'、'.join(sorted(CUSTOM))}")
     print(f"    预计耗时  ：{speed['minutes']}")
-    print(f"    结果放在  ：{Path(str(flags.get('--log_dir', DEFAULT_LOG_DIR))).resolve()}")
+    print(f"    结果放在  ：{log_dir_path(str(flags.get('--log_dir', DEFAULT_LOG_DIR)))}")
     print("    （损失曲线会存成 <结果目录>/training_curve.png）")
 
 
@@ -672,7 +684,7 @@ def do_training(flags: dict, dry_run: bool = False, want_evaluate: bool = True) 
         print("  详细报错信息在上面的输出里。")
         return code
 
-    run_dir = Path(log_dir) / run_name
+    run_dir = log_dir_path(log_dir) / run_name
     if not dry_run:
         print()
         print(f"  结果已保存到：{run_dir.resolve()}")
@@ -714,7 +726,7 @@ def do_report(log_dir: str, dry_run: bool = False, open_when_done: bool = False)
         print("  （汇总失败，可能还没跑过任何实验。先去跑一个吧）")
     elif open_when_done and not dry_run:
         if yes_no("  要现在打开结果文件夹吗？", default=True):
-            open_folder(Path(log_dir).resolve())
+            open_folder(log_dir_path(log_dir))
     return code
 
 
@@ -761,7 +773,7 @@ def action_single(dry_run: bool = False) -> None:
 
 def finished_runs(log_dir: str = DEFAULT_LOG_DIR) -> list:
     """已经训练完的运行目录（里面有 model_best.pt 的），按名字排序。"""
-    root = Path(log_dir)
+    root = log_dir_path(log_dir)
     if not root.is_dir():
         return []
     return sorted(
@@ -951,7 +963,7 @@ def main() -> int:
             elif choice == "6":
                 action_analyze_bias()
             elif choice == "7":
-                folder = Path(DEFAULT_LOG_DIR).resolve()
+                folder = log_dir_path()
                 folder.mkdir(parents=True, exist_ok=True)
                 open_folder(folder)
             elif choice == "8":
