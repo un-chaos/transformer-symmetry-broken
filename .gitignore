@@ -12,10 +12,15 @@ __pycache__/
 pytest-cache-files-*/
 
 # Experiment output
-runs/
+/runs/
 wandb/
 *.pt
 *.pth
 
-# Downloaded corpora, cached raw files and tokenizers
-data/
+# What the menu remembers for you (generated, never edited by hand)
+/run_settings.json
+
+# Downloaded corpora, cached raw files and tokenizers.
+# Anchored to the repository root on purpose: an unanchored `data/` would also
+# hide `symbreak_transformer/data/`, which is source code.
+/data/

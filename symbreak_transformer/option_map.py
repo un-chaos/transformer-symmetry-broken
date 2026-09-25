@@ -6,7 +6,7 @@ dataclasses are tied together.  Keeping that mapping in one table is what makes
 "every knob is configurable" a checkable property instead of a promise: the tests
 assert that every field of every config dataclass appears here, so a newly added
 knob can never quietly end up unreachable from the command line -- and therefore
-from ``my_config.py``, which is generated from these same tables.
+from the menu's parameter editor in ``run.py``, which reads these same tables.
 
 Two kinds of entry:
 
@@ -18,8 +18,8 @@ Two kinds of entry:
   so they are listed explicitly rather than being silently hardcoded.
 
 For the non-dataclass knobs (the training loop, the optimizer, the run directory)
-the tables are identity maps; they exist so the control-panel generator can emit
-every flag with a comment instead of a hand-maintained list.
+the tables are identity maps; they exist so the parameter editor can list every
+flag with a comment instead of relying on a hand-maintained list.
 """
 
 from __future__ import annotations

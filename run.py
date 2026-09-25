@@ -1,32 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-傻瓜式入口 —— 不用敲命令，输入数字就行；想调参数也不用改代码。
+唯一入口 —— 双击 ``run.bat``（或运行 ``python run.py``），然后输入数字。
 
-怎么用（Windows）：
-    双击仓库里的  run.bat        ← 最简单
-    或者在 VS Code 里打开这个文件，按右上角的运行按钮
-    或者在终端里输入：python run.py
+不需要记命令、不需要改任何文件、不需要看懂代码：
 
-它做什么：
-    1. 问你两三个问题（跑多久、用哪种 bias），都是输入数字；
-    2. 自动调用训练、自动算 BLEU、自动出对比图和中文报告；
-    3. 结果（日志 + 模型权重 + 损失曲线）都保存在 runs\\ 下面，并帮你打开文件夹。
+    双击 run.bat  →  输入 1（三种 bias 做对比）  →  回车
 
-想自由调参数（模型结构、初始值、超参……）：
-    菜单 4) 打开 my_config.py。那个文件里的 SETTINGS 每一项都是一个真实的命令行
-    参数，train.py 支持多少参数就能写多少 —— 没有写死的参数。改完保存，
-    再用菜单 3) 跑。文件最下面还把 train.py 的全部参数列出来供参考。
+跑完自动生成损失曲线、对比图和中文报告，并帮你打开结果文件夹。
 
-进阶用户想直接用命令行：看 README.md，用 main.py。
+想换设置再跑（模型大小、学习率、数据、bias、任意超参……）：
+
+    菜单 3) 里直接按数字改。``train.py`` 支持多少参数，那里就能改多少 ——
+    没有任何参数是写死的；改过的项会被程序自动记住，下次打开还在。
+
+本文件是**唯一**的入口；训练、评估、汇总、下载、画图都只是它内部调用的实现，
+不需要（也不应该）单独去用。
 """
 
 from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import os
-import runpy
 import subprocess
 import sys
 from pathlib import Path
@@ -35,11 +32,19 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from symbreak_transformer.config import DATASET_PRESETS, PRESETS, BiasPresets  # noqa: E402
 from symbreak_transformer.utils import configure_console_encoding  # noqa: E402
 
-MY_CONFIG = ROOT / "my_config.py"
+SCRIPTS = ROOT / "scripts"
+TRAIN_SCRIPT = SCRIPTS / "train.py"
+EVALUATE_SCRIPT = SCRIPTS / "evaluate.py"
+REPORT_SCRIPT = SCRIPTS / "report.py"
+DOWNLOAD_SCRIPT = SCRIPTS / "download_data.py"
+ANALYZE_SCRIPT = SCRIPTS / "analyze_bias.py"
+
 DEFAULT_LOG_DIR = "runs"
+
+#: 自动记住用户设置的文件（程序自己读写，**不需要**手工编辑）。
+SETTINGS_FILE = ROOT / "run_settings.json"
 
 
 # ===================================================================== #
@@ -52,7 +57,7 @@ DEFAULT_LOG_DIR = "runs"
 SPEEDS: dict = {
     "1": {
         "key": "toy",
-        "label": "玩具任务 —— 不用下载数据，每次约 15 秒",
+        "label": "玩具任务 —— 不用下载数据、不用联网，每次约 15 秒  ← 第一次用选这个",
         "minutes": "约 15 秒",
         "model": "smoke",
         "dataset_preset": "synthetic-copy",
@@ -60,11 +65,10 @@ SPEEDS: dict = {
         "max_steps": 60,
         "log_every": 5,
         "valid_every": 10,
-        "extra": [],
     },
     "2": {
         "key": "quick",
-        "label": "快速看看 —— 2000 句真实翻译数据，每次约 1 分钟",
+        "label": "快速看看 —— 2000 句真实翻译数据，每次约 1 分钟（要联网）",
         "minutes": "约 1 分钟",
         "model": "tiny",
         "dataset_preset": "multi30k-quick",
@@ -72,7 +76,6 @@ SPEEDS: dict = {
         "max_steps": 0,
         "log_every": 4,
         "valid_every": 8,
-        "extra": [],
     },
     "3": {
         "key": "long",
@@ -84,19 +87,17 @@ SPEEDS: dict = {
         "max_steps": 0,
         "log_every": 20,
         "valid_every": 40,
-        "extra": [],
     },
     "4": {
         "key": "corpus",
-        "label": "大规模语料 —— FineWeb-Edu 10B，需要先下载（很慢，CPU 上只适合试跑）",
-        "minutes": "取决于 --max_steps，建议先用 --max_steps 限制",
+        "label": "大规模语料 —— FineWeb-Edu 10B（菜单 7 先下载；CPU 上很慢）",
+        "minutes": "取决于步数，建议先用菜单 3) 把「最多训练多少步」改小",
         "model": "tiny",
         "dataset_preset": "fineweb-quick",
         "epochs": 1,
         "max_steps": 200,
         "log_every": 10,
         "valid_every": 20,
-        "extra": [],
     },
 }
 
@@ -112,6 +113,87 @@ BIASES: dict = {
 
 #: 「跑三种做对比」用的三种
 COMPARE_THREE = ["symmetric", "b-gaussian", "b-const"]
+
+_BIAS_TEXT = {
+    "symmetric": "对照组：b = 0（不破缺对称性）",
+    "b-gaussian": "高斯随机 b（随机方向破缺）",
+    "b-const": "常数 b（每个维度加同一个常数）",
+    "attn-bQbV": "注意力里的 bQ + bV",
+    "attn-full": "注意力里的 bQ + bK + bV",
+    "b-learnable": "可学习的 b（交给优化器学）",
+}
+
+#: 菜单 3) 的「常用设置」：按这个顺序显示（值是中文说明）。
+COMMON_FLAGS: dict = {
+    "--dataset_preset": "数据集：synthetic-*（玩具，不用联网）/ multi30k-*（翻译）/ fineweb-*（10B 语料）",
+    "--objective": "任务类型：translation=翻译 / denoising=去噪（原始文本，不用翻译对照）",
+    "--model": "模型大小：smoke / tiny / small / base / large（越大越强、越慢）",
+    "--bias_preset": "对称性破缺设置：symmetric / b-gaussian / b-const / attn-bQbV / attn-full / ...",
+    "--optimizer": "优化器：egd（本项目的能量守恒下降法）/ adamw / sgdm",
+    "--egd_lr": "EGD 学习率（和 F0 配套，改一个通常要一起调）",
+    "--egd_F0": "EGD 的 loss 偏移，必须低于能达到的最小 loss（默认 -1 对交叉熵永远安全）",
+    "--batch_size": "每批多少条数据（内存不够就调小）",
+    "--epochs": "训练几轮（越大越慢、一般也越好）",
+    "--max_steps": "最多训练多少步（0 = 由轮数决定；快速试跑就写个小数字）",
+    "--ctx": "上下文长度（一句话最多多少个 token）",
+    "--n_embd": "隐藏维度（不写就用模型预设的值）",
+    "--n_head": "注意力头数（必须能整除隐藏维度）",
+    "--seed": "随机种子（固定它，两次实验才有可比性）",
+    "--log_dir": "结果保存到哪个文件夹",
+    "--name": "这次实验的名字（留空 = 自动起名）",
+}
+
+#: 不放进「改参数」界面的开关：纯信息性的，或者会破坏本项目的硬性要求。
+#: * ``--no_plot``：损失曲线必须落盘，不允许通过菜单关掉它；
+#: * ``-h/--help``、``--list_models``：只是打印信息，不是"设置"。
+HIDDEN_FLAGS = {"-h", "--help", "--no_plot", "--list_models"}
+
+
+# ===================================================================== #
+#  当前设置（由「跑多久 / 哪种 bias」的问题 + 用户手改的部分组成）
+# ===================================================================== #
+#: 菜单问题的答案（「跑多久」/「哪种 bias」/「哪个优化器」）。
+STATE: dict = {"speed": "1", "bias": "b-gaussian", "optimizer": "egd"}
+
+#: 用户在菜单 3) 里手改过的参数（``--flag`` -> 值）。手改的优先级最高。
+CUSTOM: dict = {}
+
+
+def load_settings() -> None:
+    """读回上次的设置（文件不存在或坏了都当没有，绝不因此崩掉）。"""
+    try:
+        data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - 自动生成的文件，坏了就忽略
+        return
+    if not isinstance(data, dict):
+        return
+    for key in ("speed", "bias", "optimizer"):
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            STATE[key] = value
+    custom = data.get("custom")
+    if isinstance(custom, dict):
+        CUSTOM.clear()
+        CUSTOM.update({str(k): v for k, v in custom.items()})
+    # 兼容：设置里对应的编号可能已经不存在了（比如换了版本）。
+    if STATE["speed"] not in SPEEDS:
+        STATE["speed"] = "1"
+    if STATE["bias"] not in {name for name, _ in BIASES.values()}:
+        STATE["bias"] = "b-gaussian"
+    if STATE["optimizer"] not in ("egd", "adamw", "sgdm"):
+        STATE["optimizer"] = "egd"
+
+
+def save_settings() -> None:
+    """把当前设置写到 ``run_settings.json``（失败也不影响使用）。"""
+    payload = {"speed": STATE["speed"], "bias": STATE["bias"],
+               "optimizer": STATE["optimizer"], "custom": CUSTOM}
+    try:
+        SETTINGS_FILE.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+    except Exception:  # noqa: BLE001 - 记不住设置不算错误
+        pass
 
 
 # ===================================================================== #
@@ -134,16 +216,15 @@ def ask(prompt: str, options: dict, default: str | None = None) -> str:
 
     Args:
         prompt: 问题本身。
-        options: ``{key: 显示文字}`` 或 ``{key: (内部值, 说明)}``。
-        default: 直接回车时用的 key。
+        options: ``{key: 显示文字}``。
+        default: 直接回车时用的 key（``None`` 表示必须明确输入）。
     """
     if not options:
         return ""
     keys = list(options)
     print()
     print(prompt)
-    for key, value in options.items():
-        text = value[1] if isinstance(value, tuple) else value
+    for key, text in options.items():
         print(f"  {key}) {text}")
     if default is not None:
         print(f"  （直接按回车 = {default}）")
@@ -170,16 +251,8 @@ def yes_no(prompt: str, default: bool = True) -> bool:
         print("  请输入 y 或 n")
 
 
-def speed_by_key(key: str) -> dict:
-    """按 ``SPEEDS`` 里的 ``key``（toy/quick/long/corpus）取配置。"""
-    for spec in SPEEDS.values():
-        if spec["key"] == key:
-            return spec
-    raise KeyError(f"unknown speed {key!r}; known: {[s['key'] for s in SPEEDS.values()]}")
-
-
 def run_name_for(speed_key: str, bias_preset: str, optimizer: str = "egd") -> str:
-    """给这次运行起一个看得懂的名字，例如 ``quick-bgaussian-egd``。"""
+    """给这次运行起一个看得懂的名字，例如 ``quick-bgaussian``。"""
     short = bias_preset.replace("b-", "b").replace("-", "")
     name = f"{speed_key}-{short}"
     if optimizer != "egd":
@@ -187,8 +260,23 @@ def run_name_for(speed_key: str, bias_preset: str, optimizer: str = "egd") -> st
     return name
 
 
+def _triple(duration: str) -> str:
+    """
+    把「约 1 分钟」/「约 15 秒」换算成三倍时长的说法。
+
+    必须区分秒和分钟：无脑当成分钟的话，「约 15 秒」会变成「约 45 分钟」。
+    """
+    digits = "".join(ch for ch in duration if ch.isdigit())
+    if not digits:
+        return duration
+    total = int(digits) * 3
+    if "秒" in duration:
+        return f"约 {total // 60} 分钟" if total >= 60 else f"约 {total} 秒"
+    return f"约 {total} 分钟"
+
+
 # ===================================================================== #
-#  参数表 / 命令行拼装
+#  参数表 / 命令行拼装（唯一事实来源：scripts/train.py 的 argparse）
 # ===================================================================== #
 _train_module_cache = None
 
@@ -197,8 +285,7 @@ def train_parser() -> argparse.ArgumentParser:
     """``scripts/train.py`` 的 argparse 对象（缓存），用来知道有哪些参数。"""
     global _train_module_cache
     if _train_module_cache is None:
-        path = ROOT / "scripts" / "train.py"
-        spec = importlib.util.spec_from_file_location("_symbreak_train_script", path)
+        spec = importlib.util.spec_from_file_location("_symbreak_train_script", TRAIN_SCRIPT)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         _train_module_cache = module
@@ -215,27 +302,48 @@ def _action_index(parser=None) -> dict:
     return index
 
 
-def option_catalog() -> list:
+def _is_switch(action) -> bool:
+    """这个参数是不是「开关」（不带值，出现即生效）？"""
+    return isinstance(
+        action, (argparse._StoreTrueAction, argparse._StoreFalseAction)
+    ) or action.nargs == 0
+
+
+def default_of(action):
+    """参数的默认值（``SUPPRESS`` 表示"看 train.py 自己的默认"，记为 None）。"""
+    return None if action.default is argparse.SUPPRESS else action.default
+
+
+def option_groups(include_hidden: bool = False) -> list:
     """
-    把 train.py 的全部参数按分组列出来（给控制面板当参考用）。
+    把 ``train.py`` 的全部参数按分组列出来。
 
     Returns:
-        ``[(组名, [(flag, default, help)])]``。
+        ``[(组名, [(flag, action)])]``。
     """
     parser = train_parser()
-    groups: dict = {}
-    for action in parser._actions:  # noqa: SLF001
-        if not action.option_strings:
-            continue
-        flag = action.option_strings[0]
-        title_ = "其他"
-        for group in parser._action_groups:
-            if action in group._group_actions:  # noqa: SLF001
-                title_ = group.title or "其他"
-                break
-        default = None if action.default is argparse.SUPPRESS else action.default
-        groups.setdefault(title_, []).append((flag, default, (action.help or "").strip()))
-    return list(groups.items())
+    groups: list = []
+    for group in parser._action_groups:
+        rows = []
+        for action in group._group_actions:
+            if not action.option_strings:
+                continue
+            flag = action.option_strings[0]
+            if not include_hidden and flag in HIDDEN_FLAGS:
+                continue
+            rows.append((flag, action))
+        if rows:
+            groups.append((group.title or "其他", rows))
+    return groups
+
+
+def all_flags(include_hidden: bool = True) -> list:
+    """``train.py`` 认识的全部 ``--flag``（默认含隐藏项）。"""
+    flags: list = []
+    for _, rows in option_groups(include_hidden=True):
+        for flag, _ in rows:
+            flags.append(flag)
+    return flags
 
 
 def flags_to_argv(flags: dict, parser=None) -> list:
@@ -260,10 +368,7 @@ def flags_to_argv(flags: dict, parser=None) -> list:
             elif value is not False and value is not None:
                 argv += [flag, str(value)]
             continue
-        is_switch = isinstance(
-            action, (argparse._StoreTrueAction, argparse._StoreFalseAction)
-        ) or action.nargs == 0
-        if is_switch:
+        if _is_switch(action):
             if bool(value):
                 argv.append(flag)
         else:
@@ -273,15 +378,10 @@ def flags_to_argv(flags: dict, parser=None) -> list:
     return argv
 
 
-def speed_flags(
-    speed: dict,
-    bias_preset: str,
-    epochs: int | None = None,
-    optimizer: str = "egd",
-    run_name: str | None = None,
-    log_dir: str = DEFAULT_LOG_DIR,
-) -> dict:
-    """菜单驱动的一次运行对应的参数表（返回值可直接喂给 :func:`flags_to_argv`）。"""
+def speed_flags(speed: dict, bias_preset: str, epochs: int | None = None,
+                optimizer: str = "egd", run_name: str | None = None,
+                log_dir: str = DEFAULT_LOG_DIR) -> dict:
+    """「跑多久」那一组参数（用户手改的部分还没叠加上去）。"""
     flags: dict = {
         "--model": speed["model"],
         "--dataset_preset": speed["dataset_preset"],
@@ -297,42 +397,38 @@ def speed_flags(
         flags["--log_every"] = int(speed["log_every"])
     if speed.get("valid_every"):
         flags["--valid_every_updates"] = int(speed["valid_every"])
-    for item in speed.get("extra") or []:
-        if item.startswith("--") and "=" in item:
-            flag, _, value = item.partition("=")
-            flags[flag] = value
     return flags
 
 
-def build_train_command(
-    speed: dict,
-    bias_preset: str,
-    run_name: str,
-    log_dir: str = DEFAULT_LOG_DIR,
-    epochs: int | None = None,
-    optimizer: str = "egd",
-    extra_flags: dict | None = None,
-    extra_args: list | None = None,
-) -> list:
-    """
-    拼出 ``python main.py train ...`` 的参数表。
+def current_speed() -> dict:
+    """当前选中的「跑多久」（``STATE["speed"]`` 存的是菜单编号 1-4）。"""
+    return SPEEDS[STATE["speed"]]
 
-    注意**不加** ``--no_plot``：损失曲线必须落盘（每个 run 目录里一份
+
+def effective_flags() -> dict:
+    """
+    这次运行真正会用到的参数 = 「跑多久 / 哪种 bias」那一组 + 用户手改的部分。
+
+    手改的部分**最后**叠加，所以它永远优先 —— 这正是"我改过的设置说话算数"。
+    """
+    flags = speed_flags(current_speed(), STATE["bias"], optimizer=STATE["optimizer"])
+    flags.update(CUSTOM)
+    return flags
+
+
+def build_train_command(flags: dict) -> list:
+    """
+    拼出训练命令的参数表。
+
+    注意**永远不加** ``--no_plot``：损失曲线必须落盘（每个 run 目录里一份
     ``training_curve.png``），这是这个项目的硬要求。
     """
-    flags = speed_flags(
-        speed, bias_preset, epochs=epochs, optimizer=optimizer,
-        run_name=run_name, log_dir=log_dir,
-    )
-    if extra_flags:
-        flags.update(extra_flags)
-    return ["train"] + flags_to_argv(flags) + [str(a) for a in (extra_args or [])]
+    return flags_to_argv(flags)
 
 
 def build_evaluate_command(ckpt: Path, dataset_preset: str, max_samples: int = 100) -> list:
-    """拼出 ``python main.py evaluate ...`` 的参数表（跑完算一下 BLEU）。"""
+    """拼出评估命令的参数表（跑完算一下测试集 loss 和 BLEU）。"""
     return [
-        "evaluate",
         "--ckpt", str(ckpt),
         "--split", "test",
         "--dataset_preset", dataset_preset,
@@ -341,15 +437,27 @@ def build_evaluate_command(ckpt: Path, dataset_preset: str, max_samples: int = 1
 
 
 def build_report_command(log_dir: str = DEFAULT_LOG_DIR) -> list:
-    """拼出 ``python main.py report ...`` 的参数表。"""
-    return ["report", "--log_dir", log_dir]
+    """拼出汇总（对比图 + 报告）命令的参数表。"""
+    return ["--log_dir", log_dir]
 
 
-def run_command(args: list, dry_run: bool = False) -> int:
-    """执行 ``python main.py <args>``，输出直接显示在屏幕上。"""
-    argv = [sys.executable, str(ROOT / "main.py")] + [str(a) for a in args]
+def build_analyze_command(run_dir: Path, dataset_preset: str,
+                          max_samples: int = 100) -> list:
+    """拼出「bias 到底改变了什么」分析命令的参数表。"""
+    return [
+        "--ckpt", str(Path(run_dir) / "model_best.pt"),
+        "--split", "test",
+        "--dataset_preset", str(dataset_preset),
+        "--max_samples", str(max_samples),
+        "--out", str(Path(run_dir) / "bias_analysis.json"),
+    ]
+
+
+def run_command(script: Path, args: list, dry_run: bool = False) -> int:
+    """执行一个内部脚本，输出直接显示在屏幕上。"""
+    argv = [sys.executable, str(script)] + [str(a) for a in args]
     print()
-    print("  正在执行：" + " ".join(argv[2:]))
+    print("  正在执行：" + " ".join(argv[1:]))
     print()
     if dry_run:
         print("  （dry-run：只显示不执行）")
@@ -371,236 +479,195 @@ def open_folder(path: Path) -> None:
         print(f"  打不开文件夹（{exc}），你可以自己去看：{path}")
 
 
-def open_in_editor(path: Path) -> None:
-    """用系统默认程序打开文件（.py 一般就是 VS Code 或记事本）。"""
-    try:
-        if sys.platform.startswith("win"):
-            os.startfile(str(path))  # type: ignore[attr-defined]
-        elif sys.platform == "darwin":
-            subprocess.call(["open", str(path)])
+# ===================================================================== #
+#  菜单 3)：改参数（train.py 支持多少，这里就能改多少）
+# ===================================================================== #
+def _render(value) -> str:
+    """把参数值渲染成人看的文字。"""
+    if value is None:
+        return "（默认）"
+    if value is True:
+        return "开"
+    if value is False:
+        return "关"
+    return str(value)
+
+
+def _row_text(flag: str, action) -> str:
+    """菜单里一行：``--n_embd = 128  ★``。"""
+    value = effective_flags().get(flag)
+    if value is None:
+        value = default_of(action)
+    star = "  ★" if flag in CUSTOM else ""
+    return f"{flag:<24} = {_render(value)}{star}"
+
+
+def _short_help(action) -> str:
+    text = (action.help or "").strip().replace("\n", " ")
+    return text[:70]
+
+
+def _coerce(raw: str, action):
+    """把用户敲的文字变成参数值，顺便检查类型。"""
+    kind = action.type
+    if kind is int:
+        return int(raw)
+    if kind is float:
+        return float(raw)
+    return raw
+
+
+def ask_value(flag: str, action) -> None:
+    """
+    改一个参数。回车 = 恢复默认（也就是"不手改这一项"）。
+
+    有固定选项的参数（数据集、模型大小、优化器……）直接给编号选；
+    开关类参数问 y/n；其余的自己输入值。
+    """
+    print()
+    print(f"  {flag}   {_short_help(action)}")
+    print(f"  现在：{_render(effective_flags().get(flag))}   "
+          f"（train.py 的默认值：{_render(default_of(action))}）")
+
+    if action.choices:
+        choices = list(action.choices)
+        labels = {str(i + 1): str(c) for i, c in enumerate(choices)}
+        key = ask("  选一个（回车 = 保持现在的）：", labels, default="")
+        if not key:
+            return
+        value = choices[int(key) - 1]
+    elif _is_switch(action):
+        want = yes_no("  要加上这个开关吗？", default=bool(CUSTOM.get(flag)))
+        value = True if want else None
+    else:
+        hint = "（直接回车 = 恢复默认）"
+        raw = input(f"  输入新值 {hint}：").strip()
+        if not raw:
+            value = None
         else:
-            subprocess.call(["xdg-open", str(path)])
-        print(f"  已打开：{path}")
-        print("  改完记得保存，然后回菜单选 3) 就能用新参数跑。")
-    except Exception as exc:  # pragma: no cover
-        print(f"  打不开（{exc}）。你可以自己用记事本/VS Code 打开：{path}")
+            try:
+                value = _coerce(raw, action)
+            except ValueError:
+                print(f"  {raw!r} 不是合法的值（需要 {getattr(action.type, '__name__', '文本')}），没改。")
+                return
+
+    if value is None:
+        CUSTOM.pop(flag, None)
+        print(f"  已把 {flag} 恢复成默认。")
+    else:
+        CUSTOM[flag] = value
+        print(f"  已把 {flag} 改成 {_render(value)}。")
+    save_settings()
 
 
-# ===================================================================== #
-#  my_config.py —— 自由配置的控制面板
-# ===================================================================== #
-#  设计要点：面板里的每一项都是一个**真实的命令行参数**（``--flag``），参数清单由
-#  scripts/train.py 的 argparse 自动生成，所以
-#    * 没有参数是写死的：train.py 有多少个参数，这里就能配多少个；
-#    * 不会过期：以后 train.py 加了新参数，重新生成一次就会出现在"全部参数"里。
-#  用户只需要改 SETTINGS 里那几行；想调更细的就把"全部参数"里的某行搬到 SETTINGS。
-
-#: 面板格式版本；读到别的格式就忽略并重新生成，避免解析旧文件出错。
-PANEL_FORMAT = 2
-
-#: SETTINGS 默认放哪些参数（常用），顺序即显示顺序。值是中文说明。
-COMMON_FLAGS: dict = {
-    "--dataset_preset": "数据集：multi30k-quick(2000句) / multi30k-tiny(8000句) / "
-                        "multi30k(全部) / fineweb-quick / fineweb-10b(10B词) / synthetic-*(玩具)",
-    "--objective": "任务类型：translation=翻译（要平行语料）/ denoising=去噪（原始文本）",
-    "--model": "模型大小：smoke / tiny / small / base / large（越大越强、越慢）",
-    "--bias_preset": "对称性破缺设置：symmetric / b-gaussian / b-const / attn-bQbV / attn-full / ...",
-    "--optimizer": "优化器：egd（本项目的能量守恒下降法）/ adamw / sgdm",
-    "--egd_lr": "EGD 学习率（和 --egd_F0 配套，改一个通常要一起调）",
-    "--egd_F0": "EGD 的 loss 偏移，必须低于能达到的最小 loss；默认 -1 对交叉熵永远安全",
-    "--batch_size": "每批多少条数据（内存不够就调小）",
-    "--epochs": "训练几轮（越大越慢、一般也越好）",
-    "--max_steps": "最多训练多少步（0 = 由 epochs 决定；快速试跑就写个小数字）",
-    "--ctx": "上下文长度（一句话最多多少个 token）",
-    "--n_embd": "隐藏维度（不写就用模型预设的值）",
-    "--n_head": "注意力头数（必须能整除 --n_embd）",
-    "--log_dir": "结果保存到哪个文件夹",
-    "--name": "这次实验的名字（空字符串 = 自动起名）",
-}
+def _common_rows() -> list:
+    """「常用设置」界面的行（只保留 train.py 真的有的参数）。"""
+    index = _action_index()
+    return [(flag, index[flag]) for flag in COMMON_FLAGS if flag in index]
 
 
-def _panel_reference_block(current: dict) -> str:
-    """文件末尾的"全部参数"参考块：把 train.py 的每个参数以注释形式列出来。"""
-    lines = [
-        "# =====================================================================",
-        "#  全部参数（参考用，默认不用动）。",
-        "#",
-        "#  想调哪个：把那一行前面的 # 去掉、改成你要的值，然后把它搬到上面的",
-        "#  SETTINGS 里（或者直接在 SETTINGS 里照着写一行）。等号右边是 train.py",
-        "#  的默认值。参数清单是从 train.py 自动生成的，不会过期。",
-        "# =====================================================================",
-    ]
-    for group_title, entries in option_catalog():
-        shown = [item for item in entries if item[0] not in current]
-        if not shown:
-            continue
-        lines.append(f"# === {group_title} ===")
-        for flag, default, help_text in shown:
-            note = help_text.replace("\n", " ")[:58]
-            rendered = "None" if default is None else repr(default)
-            lines.append(f'#   "{flag}": {rendered},   # {note}')
-    return "\n".join(lines)
-
-
-def render_my_config(flags: dict, extra: list | None = None) -> str:
-    """生成 ``my_config.py`` 的内容（中文说明 + 完整参数参考）。"""
-    bias = flags.get("--bias_preset", "(默认)")
-    rows = []
-    for flag, note in COMMON_FLAGS.items():
-        value = flags.get(flag)
-        rendered = "None" if value is None else repr(value)
-        rows.append(f'    "{flag}": {rendered},   # {note}')
-    known = set(COMMON_FLAGS)
-    other = {k: v for k, v in flags.items() if k not in known}
-    if other:
-        rows.append("")
-        rows.append("    # 这次用到的其它参数（也都可以改）：")
-        for flag, value in other.items():
-            rows.append(f'    "{flag}": {value!r},')
-    body = "\n".join(rows)
-    return f'''\
-# -*- coding: utf-8 -*-
-# =====================================================================
-#  这是你的实验设置 —— 想怎么调就怎么调。
-#
-#  改完保存，然后运行 run.bat（或 python run.py）选菜单 3)。
-#
-#  规则很简单：
-#    * SETTINGS 里每一项都是一个真实的命令行参数（--xxx）。train.py 支持多少
-#      参数，这里就能写多少 —— 没有任何参数是写死的。
-#    * 值就是 Python 的值：数字写 0.1，字符串写 "abc"，开关写 True / False。
-#    * 想用的参数不在 SETTINGS 里？看文件最下面的"全部参数"参考块，把它搬上来。
-#    * EXTRA_ARGS 是万能兜底：直接写一串命令行参数，原样追加到最后。
-# =====================================================================
-
-FORMAT = {PANEL_FORMAT}
-
-# ============ 常用设置：改这里就够了 ============
-# 当前 bias 设置：{bias}
-SETTINGS = {{
-{body}
-}}
-
-# ============ 万能兜底：想加什么参数就写在这里 ============
-# 例：EXTRA_ARGS = ["--seed", "123", "--grad_clip", "1.0"]
-EXTRA_ARGS = {list(extra or [])!r}
-
-{_panel_reference_block(flags)}
-'''
-
-
-def write_my_config(flags: dict, path=MY_CONFIG, extra: list | None = None):
-    """把设置写进 ``my_config.py``（返回写入的路径）。"""
-    path = Path(path)
-    path.write_text(render_my_config(flags, extra), encoding="utf-8")
-    return path
-
-
-def read_my_config(path=MY_CONFIG):
-    """
-    读回 ``my_config.py``。
-
-    Returns:
-        ``{"flags": {...}, "extra": [...]}``；文件不存在、格式不对、或被手改坏了
-        （比如少了引号）都返回 ``None`` —— 菜单当成"没有上次的设置"，绝不崩。
-    """
-    path = Path(path)
-    if not path.exists():
-        return None
-    try:
-        namespace = runpy.run_path(str(path))
-    except Exception as exc:  # noqa: BLE001 - a hand-edited file must not break us
-        print(f"（my_config.py 读不了：{exc}")
-        print("  没关系，忽略它，用菜单选就行；选一次之后我可以重新生成一份）")
-        return None
-    if int(namespace.get("FORMAT", 0)) != PANEL_FORMAT:
-        print("（my_config.py 是旧格式，已忽略；菜单 4) 可以重新生成一份）")
-        return None
-    settings = namespace.get("SETTINGS")
-    if not isinstance(settings, dict) or not settings:
-        print("（my_config.py 里没有 SETTINGS，已忽略）")
-        return None
-    extra = namespace.get("EXTRA_ARGS") or []
-    if not isinstance(extra, list):
-        print("（my_config.py 的 EXTRA_ARGS 不是列表，已忽略它）")
-        extra = []
-    return {"flags": {str(k): v for k, v in settings.items()}, "extra": [str(a) for a in extra]}
-
-
-def maybe_write_panel(flags: dict) -> None:
-    """
-    第一次跑完时生成一份 ``my_config.py`` 模板。
-
-    已经有这个文件就**绝不覆盖** —— 用户可能已经仔细调过里面的参数了。
-    """
-    if MY_CONFIG.exists():
-        print(f"  （{MY_CONFIG.name} 已存在，没有覆盖它。想按刚才的设置重写，")
-        print(f"    就先删掉这个文件，然后选菜单 4) 重新生成）")
+def _edit_all() -> None:
+    """「全部参数」界面：把 train.py 的每一个参数都列出来，按编号改。"""
+    rows: list = []
+    for group_title, entries in option_groups():
+        print(f"\n  --- {group_title} ---")
+        for flag, action in entries:
+            rows.append((flag, action))
+            print(f"  {len(rows):>3}) {_row_text(flag, action)}")
+    if not rows:
         return
-    try:
-        write_my_config(flags)
-        print(f"  已生成 {MY_CONFIG.name}（想自由调参数就选菜单 4)）")
-    except Exception as exc:  # noqa: BLE001
-        print(f"  （生成 {MY_CONFIG.name} 失败：{exc}）")
+    raw = input("\n改哪一项？（回车=返回）：").strip()
+    if raw == "0":
+        return
+    if raw.isdigit() and 1 <= int(raw) <= len(rows):
+        flag, action = rows[int(raw) - 1]
+        ask_value(flag, action)
+
+
+def action_settings() -> None:
+    """菜单 3)：修改训练设置。改过的项自动记住，不需要编辑任何文件。"""
+    while True:
+        title("修改训练设置")
+        rows = _common_rows()
+        print("  带 ★ 的是你手动改过的项，它们的优先级最高（回车进去可以恢复默认）。")
+        print("  输入编号就能改；直接回车返回。")
+        print()
+        for index, (flag, action) in enumerate(rows, start=1):
+            print(f"  {index:>2}) {_row_text(flag, action)}")
+        print()
+        print("   a) 全部参数（train.py 支持的所有设置）")
+        print("   d) 全部恢复默认")
+        raw = input("\n改哪一项？（回车=返回）：").strip().lower()
+        if raw in ("", "0", "b", "q"):
+            return
+        if raw == "a":
+            _edit_all()
+            continue
+        if raw == "d":
+            CUSTOM.clear()
+            save_settings()
+            print("  已全部恢复默认。")
+            continue
+        if raw.isdigit() and 1 <= int(raw) <= len(rows):
+            flag, action = rows[int(raw) - 1]
+            ask_value(flag, action)
+        else:
+            print(f"  没有 {raw!r} 这个选项。")
+
+
+def action_show_settings() -> None:
+    """菜单 4)：把这次会用到的设置原原本本列出来。"""
+    title("当前设置")
+    flags = effective_flags()
+    speed = current_speed()
+    print(f"  数据      ：{speed['dataset_preset']}")
+    print(f"  模型大小  ：{speed['model']}")
+    print(f"  对称性破缺：{_BIAS_TEXT.get(STATE['bias'], STATE['bias'])}")
+    print(f"  优化器    ：{STATE['optimizer']}")
+    print(f"  预计耗时  ：{speed['minutes']}")
+    print()
+    print(f"  实际传给训练的 {len(flags)} 个参数：")
+    for flag, value in flags.items():
+        star = "  ★" if flag in CUSTOM else ""
+        print(f"    {flag:<26} {_render(value)}{star}")
+    print()
+    print("  想改就回菜单 3)。")
 
 
 # ===================================================================== #
 #  各个菜单动作
 # ===================================================================== #
-_BIAS_TEXT = {
-    "symmetric": "对照组：b = 0（不破缺对称性）",
-    "b-gaussian": "高斯随机 b（随机方向破缺）",
-    "b-const": "常数 b（每个维度加同一个常数）",
-    "attn-bQbV": "注意力里的 bQ + bV",
-    "attn-full": "注意力里的 bQ + bK + bV",
-    "b-learnable": "可学习的 b（交给优化器学）",
-}
-
-
-def describe(speed: dict, bias_preset: str, epochs: int, optimizer: str, log_dir: str) -> None:
+def describe(flags: dict) -> None:
     """用大白话把「接下来要干什么」说一遍，让人确认。"""
-    bias_text = _BIAS_TEXT.get(bias_preset, bias_preset)
     print()
     print("  接下来会这样做：")
-    data_note = speed["label"].split("——")[-1].strip()
-    print(f"    数据      ：{speed['dataset_preset']}（{data_note}）")
-    print(f"    模型大小  ：{speed['model']}")
-    print(f"    对称性破缺：{bias_text}")
-    print(f"    训练轮数  ：{epochs}")
-    print(f"    优化器    ：{optimizer}")
+    speed = current_speed()
+    print(f"    数据      ：{flags.get('--dataset_preset')}（{speed['label'].split('——')[-1].strip()}）")
+    print(f"    模型大小  ：{flags.get('--model')}")
+    print(f"    对称性破缺：{_BIAS_TEXT.get(STATE['bias'], STATE['bias'])}")
+    print(f"    训练轮数  ：{flags.get('--epochs')}")
+    print(f"    优化器    ：{flags.get('--optimizer')}")
+    if CUSTOM:
+        print(f"    你手改过的：{'、'.join(sorted(CUSTOM))}")
     print(f"    预计耗时  ：{speed['minutes']}")
-    print(f"    结果放在  ：{Path(log_dir).resolve()}")
-    print(f"    （损失曲线会存成 <结果目录>/training_curve.png）")
+    print(f"    结果放在  ：{Path(str(flags.get('--log_dir', DEFAULT_LOG_DIR))).resolve()}")
+    print("    （损失曲线会存成 <结果目录>/training_curve.png）")
 
 
-def do_training(
-    speed: dict,
-    bias_preset: str,
-    epochs: int,
-    optimizer: str,
-    log_dir: str,
-    dry_run: bool = False,
-    want_evaluate: bool = True,
-    extra_flags: dict | None = None,
-    extra_args: list | None = None,
-    run_name: str | None = None,
-) -> int:
+def do_training(flags: dict, dry_run: bool = False, want_evaluate: bool = True) -> int:
     """
     跑一次训练（+ 尽量算一下测试集 BLEU），返回退出码。
 
     训练失败只会打印提示，不会让整个菜单崩掉。
     """
-    run_name = run_name or run_name_for(speed["key"], bias_preset, optimizer)
-    command = build_train_command(
-        speed, bias_preset, run_name, log_dir=log_dir, epochs=epochs,
-        optimizer=optimizer, extra_flags=extra_flags, extra_args=extra_args,
-    )
-    code = run_command(command, dry_run=dry_run)
+    log_dir = str(flags.get("--log_dir", DEFAULT_LOG_DIR))
+    run_name = str(flags.get("--name") or "run")
+    code = run_command(TRAIN_SCRIPT, build_train_command(flags), dry_run=dry_run)
     if code != 0:
         print()
         print(f"  训练出错了（返回码 {code}）。常见原因：")
-        print("    - 没连上网，下载不了数据（可以先选「玩具任务」，不需要网络）")
-        print("    - 大语料还没下载完（先跑 python main.py download-data --status 看看）")
+        print("    - 没连上网，下载不了数据（菜单 1) 的「玩具任务」不需要网络）")
+        print("    - 大语料还没下载完（回菜单 7) 可以下载 / 看进度）")
         print("    - 磁盘空间不够")
         print("  详细报错信息在上面的输出里。")
         return code
@@ -629,7 +696,10 @@ def do_training(
         print()
         print("  再算一下测试集上的 loss 和 BLEU（越高越好）……")
         try:
-            run_command(build_evaluate_command(ckpt, speed["dataset_preset"]))
+            run_command(
+                EVALUATE_SCRIPT,
+                build_evaluate_command(ckpt, str(flags.get("--dataset_preset", ""))),
+            )
         except Exception as exc:  # noqa: BLE001
             print(f"  （没算成：{exc}；不影响训练结果）")
     return 0
@@ -639,7 +709,7 @@ def do_report(log_dir: str, dry_run: bool = False, open_when_done: bool = False)
     """出对比图和对比表格。"""
     print()
     print("  正在汇总所有结果，生成对比图……")
-    code = run_command(build_report_command(log_dir), dry_run=dry_run)
+    code = run_command(REPORT_SCRIPT, build_report_command(log_dir), dry_run=dry_run)
     if code != 0:
         print("  （汇总失败，可能还没跑过任何实验。先去跑一个吧）")
     elif open_when_done and not dry_run:
@@ -650,7 +720,9 @@ def do_report(log_dir: str, dry_run: bool = False, open_when_done: bool = False)
 
 def action_compare_three(dry_run: bool = False) -> None:
     """跑三种 bias 各一次，然后出对比图 —— 第一次用推荐这个。"""
-    key = ask("先选「跑多久」：", {k: v["label"] for k, v in SPEEDS.items()}, default="2")
+    key = ask("先选「跑多久」：", {k: v["label"] for k, v in SPEEDS.items()}, default=STATE["speed"])
+    STATE["speed"] = key
+    save_settings()
     speed = SPEEDS[key]
     print()
     print("  会依次跑这三种，其它设置完全相同：")
@@ -660,110 +732,135 @@ def action_compare_three(dry_run: bool = False) -> None:
     print(f"  每一次{speed['minutes']}，三次总共大概 {_triple(speed['minutes'])}。")
     if not yes_no("  可以开始吗？", default=True):
         return
-    last_flags: dict = {}
     for index, bias_preset in enumerate(COMPARE_THREE, start=1):
         title(f"第 {index}/3 次，正在跑：{bias_preset}")
-        do_training(speed, bias_preset, speed["epochs"], "egd", DEFAULT_LOG_DIR, dry_run)
-        last_flags = speed_flags(
-            speed, bias_preset, epochs=speed["epochs"], optimizer="egd"
-        )
-    maybe_write_panel(last_flags)
+        STATE["bias"] = bias_preset
+        do_training(effective_flags(), dry_run)
+    STATE["bias"] = COMPARE_THREE[-1]
+    save_settings()
     do_report(DEFAULT_LOG_DIR, dry_run, open_when_done=True)
-
-
-def _triple(duration: str) -> str:
-    """
-    把「约 1 分钟」/「约 15 秒」换算成三倍时长的说法。
-
-    必须区分秒和分钟：无脑当成分钟的话，「约 15 秒」会变成「约 45 分钟」。
-    """
-    digits = "".join(ch for ch in duration if ch.isdigit())
-    if not digits:
-        return duration
-    total = int(digits) * 3
-    if "秒" in duration:
-        return f"约 {total // 60} 分钟" if total >= 60 else f"约 {total} 秒"
-    return f"约 {total} 分钟"
 
 
 def action_single(dry_run: bool = False) -> None:
     """只跑一种 bias。"""
-    key = ask("先选「跑多久」：", {k: v["label"] for k, v in SPEEDS.items()}, default="2")
+    key = ask("先选「跑多久」：", {k: v["label"] for k, v in SPEEDS.items()}, default=STATE["speed"])
+    STATE["speed"] = key
     speed = SPEEDS[key]
-    bias_key = ask("用哪种 bias？", {k: v[1] for k, v in BIASES.items()}, default="2")
-    bias_preset = BIASES[bias_key][0]
-    epochs_raw = input(f"  训练几轮？（直接回车 = {speed['epochs']}）：").strip()
-    epochs = int(epochs_raw) if epochs_raw.isdigit() and int(epochs_raw) > 0 else speed["epochs"]
-    describe(speed, bias_preset, epochs, "egd", DEFAULT_LOG_DIR)
+    bias_key = ask("用哪种 bias？", {k: v[1] for k, v in BIASES.items()},
+                   default=next((k for k, v in BIASES.items() if v[0] == STATE["bias"]), "2"))
+    STATE["bias"] = BIASES[bias_key][0]
+    save_settings()
+    flags = effective_flags()
+    describe(flags)
     if not yes_no("  可以开始吗？", default=True):
         return
-    title(f"正在跑：{bias_preset}")
-    do_training(speed, bias_preset, epochs, "egd", DEFAULT_LOG_DIR, dry_run)
-    maybe_write_panel(
-        speed_flags(speed, bias_preset, epochs=epochs, optimizer="egd")
-    )
+    title(f"正在跑：{STATE['bias']}")
+    do_training(flags, dry_run)
     do_report(DEFAULT_LOG_DIR, dry_run, open_when_done=True)
 
 
-def action_from_config(dry_run: bool = False) -> None:
-    """按 ``my_config.py`` 里的设置跑（参数完全由那个文件决定）。"""
-    panel = read_my_config()
-    if not panel:
+def finished_runs(log_dir: str = DEFAULT_LOG_DIR) -> list:
+    """已经训练完的运行目录（里面有 model_best.pt 的），按名字排序。"""
+    root = Path(log_dir)
+    if not root.is_dir():
+        return []
+    return sorted(
+        (path for path in root.iterdir() if (path / "model_best.pt").is_file()),
+        key=lambda path: path.name,
+    )
+
+
+def dataset_preset_of(run_dir: Path) -> str:
+    """从那次运行的 ``args.json`` 里读回数据集；读不到就用当前的设置。"""
+    fallback = str(effective_flags().get("--dataset_preset") or "multi30k-quick")
+    try:
+        payload = json.loads((Path(run_dir) / "args.json").read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - 缺文件不算错误
+        return fallback
+    if not isinstance(payload, dict):
+        return fallback
+    return str(payload.get("dataset_preset") or fallback)
+
+
+def action_analyze_bias(dry_run: bool = False) -> None:
+    """菜单 6)：量一下这个 bias 到底把模型算的东西改变了多少。"""
+    runs = finished_runs()
+    if not runs:
         print()
-        print(f"  还没有可用的 {MY_CONFIG.name}。选菜单 4) 我可以立刻生成一份带中文说明的。")
+        print("  还没有训练好的模型。先回菜单 1) 或 2) 跑一次")
+        print("  （选「玩具任务」的话，不用联网、十几秒就跑完）。")
         return
-    flags = dict(panel["flags"])
-    extra = list(panel["extra"])
+    if len(runs) == 1:
+        run_dir = runs[0]
+    else:
+        options = {str(index): path.name for index, path in enumerate(runs, 1)}
+        run_dir = runs[int(ask("  分析哪一个？", options, default="1")) - 1]
 
     print()
-    print(f"  将按 {MY_CONFIG.name} 运行，参数如下（共 {len(flags)} 项）：")
-    for flag, value in flags.items():
-        print(f"    {flag:<26} {value}")
-    if extra:
-        print(f"    EXTRA_ARGS                 {' '.join(extra)}")
-    print()
-    print("  注意：--log_dir / --name 决定结果存哪里、叫什么。")
+    print(f"  将分析「{run_dir.name}」：把这个模型里的 bias 去掉，")
+    print("  看它的输出改变了多少 —— 改变越大，这个 bias 对模型越重要。")
     if not yes_no("  可以开始吗？", default=True):
         return
+    title(f"正在分析：{run_dir.name}")
+    code = run_command(
+        ANALYZE_SCRIPT, build_analyze_command(run_dir, dataset_preset_of(run_dir)),
+        dry_run=dry_run,
+    )
+    if code == 0 and not dry_run:
+        out = run_dir / "bias_analysis.json"
+        if out.exists():
+            print()
+            print(f"  分析结果已保存到：{out.resolve()}")
 
-    command = ["train"] + flags_to_argv(flags) + extra
-    code = run_command(command, dry_run=dry_run)
-    if code != 0:
+
+def action_download(dry_run: bool = False) -> None:
+    """下载大规模语料（在新窗口里跑，方便看到进度）。"""
+    print()
+    print("  将下载 FineWeb-Edu sample/10BT（约 10B 词、14 个分片、约 28.5 GB）。")
+    print("  这是**断点续传**的：中途断了再跑一次就会接着下，不会重复下载。")
+    run_command(DOWNLOAD_SCRIPT, ["--status"])
+    if not yes_no("  现在开始下载吗？（会另开一个窗口显示进度）", default=True):
         return
-    log_dir = str(flags.get("--log_dir", DEFAULT_LOG_DIR))
-    do_report(log_dir, dry_run, open_when_done=True)
-
-
-def action_edit_config() -> None:
-    """打开 ``my_config.py`` 让用户自由调参数（没有就先生成一份）。"""
-    if not MY_CONFIG.exists():
-        panel = read_my_config()
-        write_my_config(panel["flags"] if panel else speed_flags(
-            SPEEDS["2"], "b-gaussian", epochs=2
-        ))
-        print(f"  已生成一份 {MY_CONFIG.name}（里面每一项都有中文说明）。")
-    open_in_editor(MY_CONFIG)
+    if dry_run:
+        print("  （dry-run：不启动）")
+        return
+    try:
+        if sys.platform.startswith("win"):
+            subprocess.Popen(
+                ["cmd.exe", "/k", f'cd /d "{ROOT}" && "{sys.executable}" "{DOWNLOAD_SCRIPT}"'],
+                cwd=str(ROOT),
+            )
+            print("  已在新窗口里开始下载。那个窗口会实时显示进度，")
+            print("  下完它自己会停住（按任意键关闭）。")
+        else:
+            run_command(DOWNLOAD_SCRIPT, [])
+    except Exception as exc:  # noqa: BLE001
+        print(f"  开新窗口失败（{exc}），改为在当前窗口下载。")
+        run_command(DOWNLOAD_SCRIPT, [])
 
 
 def action_help() -> None:
     """讲清楚每一项是什么意思、能改什么。"""
-    title("我能改什么？")
-    print(f"""
-  1) 最省事：直接运行 run.py，用数字选。不用改任何文件。
+    title("帮助：每个选项都是什么意思")
+    print("""
+  怎么用：只运行这个程序（双击 run.bat），然后输入数字。
+  没有别的入口，也不需要改任何文件。
 
-  2) 想自由调参数：选菜单 4) 打开 {MY_CONFIG.name}。
-     里面 SETTINGS 的每一项都是一个真实的命令行参数，比如
-         "--n_embd": 256,        # 隐藏维度
-         "--dropout": 0.1,       # dropout
-         "--egd_lr": 1.0,        # 学习率
-         "--bias_mode": "gaussian",
-     改完保存，回菜单选 3) 就跑。**没有写死的参数**：train.py 支持多少参数，
-     那个文件里就能写多少；文件最下面还把所有参数按分组列出来了。
-
-     也支持 {MY_CONFIG.name} 里的 EXTRA_ARGS 直接追加命令行参数。
-
-  3) 想看全部参数：菜单里有「查看全部参数」，或者命令行
-         python main.py train --help
+  菜单每一项做什么：
+    1) 三种 bias 做对比 —— 一次跑三次（b=0 / 高斯 / 常数），最后出对比图。
+       第一次用就选这个，选「玩具任务」完全不用联网。
+    2) 只跑一种 bias —— 想单独看某一种的时候用。
+    3) 修改训练设置 —— 模型大小、学习率、数据、任意超参都在这里改。
+       带 ★ 的是你改过的项；回车进去可以恢复默认。改过就自动记住。
+    4) 查看当前设置 —— 把这次真正会用到的参数原原本本列出来。
+    5) 看已有结果 —— 不重新训练，只把 runs\\ 里的结果重新画成对比图。
+    6) 分析 bias —— 拿一个训练好的模型，把里面的 bias 去掉，看它的输出改变了
+       多少。改变越大，说明这个 bias 对模型越重要；这是「对称性破缺到底有没有
+       用」的量化答案。
+    7) 打开结果文件夹。
+    8) 下载大规模语料（FineWeb-Edu 10B，约 28.5 GB，可断点续传）。
+    9) 这个帮助。
+    0) 退出。
 
   几个关键概念：
 
@@ -774,10 +871,11 @@ def action_help() -> None:
       注意力 bQ/bV  在 attention 内部加偏置（参考项目那种做法）
       加了这个偏置以后，attention 原来的「旋转对称性」就被打破了。
 
-    dataset / objective —— 数据从哪来、训练什么任务。
+    数据集 / 任务类型 —— 数据从哪来、训练什么。
+      synthetic-*  程序自己生成的玩具任务：不用下载、不用联网，先跑通流程
       multi30k-*   翻译（translation）：平行语料，主指标是 BLEU
       fineweb-*    去噪（denoising）：10B 词英文网页语料，不需要翻译标注
-                   先跑 python main.py download-data 下载（约 28.5 GB，可断点续传）
+                   先回菜单 7) 下载
 
     egd_lr / egd_F0 —— EGD 的两个关键超参，是配套的：lr 乘在动量上，
     (loss - F0) 除在动量上。把 F0 改小就要把 lr 相应调大。
@@ -799,30 +897,16 @@ def action_help() -> None:
 """)
 
 
-def action_list_options() -> None:
-    """把 train.py 的全部参数按分组打印出来。"""
-    title("全部参数（train.py 支持的所有设置）")
-    for group_title, entries in option_catalog():
-        print(f"\n  --- {group_title} ---")
-        for flag, default, help_text in entries:
-            rendered = "None" if default is None else repr(default)
-            note = f"  # {help_text}" if help_text else ""
-            print(f"    {flag:<28} 默认 {rendered}{note}")
-    print(f"\n  这些都可以写进 {MY_CONFIG.name} 的 SETTINGS 里。")
-
-
-# ===================================================================== #
-#  主菜单
-# ===================================================================== #
 MENU = {
-    "1": "跑三种 bias 做对比（b=0 / 高斯 / 常数）   ← 第一次用选这个",
-    "2": "只跑一种 bias",
-    "3": f"按 {MY_CONFIG.name} 里的设置跑（可自由调参数）",
-    "4": f"打开 {MY_CONFIG.name} 调参数（自由配置）",
-    "5": "看已有结果（出对比图）",
-    "6": "打开结果文件夹",
-    "7": "查看全部参数 / 说明",
-    "8": "下载大规模语料（FineWeb-Edu 10B，可断点续传）",
+    "1": "开始训练：三种 bias 做对比（b=0 / 高斯 / 常数）   ← 第一次用选这个",
+    "2": "开始训练：只跑一种 bias",
+    "3": "修改训练设置（模型大小 / 学习率 / 数据 / 全部参数）",
+    "4": "查看当前设置",
+    "5": "看已有结果（重新出对比图和报告）",
+    "6": "分析 bias 到底改变了什么（挑一个训练好的模型）",
+    "7": "打开结果文件夹",
+    "8": "下载大规模语料（FineWeb-Edu 10B，约 28.5 GB，可断点续传）",
+    "9": "帮助：每个选项是什么意思",
     "0": "退出",
 }
 
@@ -833,146 +917,58 @@ def welcome() -> None:
     print("#  对称性破缺 Transformer —— 一键运行")
     print("#  不用敲命令：输入数字、按回车就行")
     hr("#")
+    loaded = [f"{k}={v}" for k, v in (("跑多久", STATE["speed"]), ("bias", STATE["bias"]))] if CUSTOM else []
+    if loaded:
+        print(f"  （已记住你上次的设置：{'、'.join(loaded)}"
+              f"{'，还有你手改过的参数' if CUSTOM else ''}）")
 
 
-def action_download(dry_run: bool = False) -> None:
-    """下载大规模语料（在新窗口里跑，方便看到进度）。"""
-    print()
-    print("  将下载 FineWeb-Edu sample/10BT（约 10B 词、14 个分片、约 28.5 GB）。")
-    print("  这是**断点续传**的：中途断了再跑一次就会接着下，不会重复下载。")
-    status = ["download-data", "--status"]
-    run_command(status)
-    if not yes_no("  现在开始下载吗？（会另开一个窗口显示进度）", default=True):
-        return
-    if dry_run:
-        print("  （dry-run：不启动）")
-        return
-    try:
-        if sys.platform.startswith("win"):
-            subprocess.Popen(
-                ["cmd.exe", "/k", f'cd /d "{ROOT}" && python main.py download-data'],
-                cwd=str(ROOT),
-            )
-            print("  已在新窗口里开始下载。那个窗口会实时显示进度，")
-            print("  下完它自己会停住（按任意键关闭）。")
-        else:
-            run_command(["download-data"])
-    except Exception as exc:  # noqa: BLE001
-        print(f"  开新窗口失败（{exc}），改为在当前窗口下载。")
-        run_command(["download-data"])
-
-
-def main(argv=None) -> int:
-    """菜单主循环。``argv`` 预留给测试（``--from-config`` / ``--speed`` 等）。"""
+def main() -> int:
+    """菜单主循环 —— 这是本程序**唯一**的用法。"""
     configure_console_encoding()
-    argv = list(sys.argv[1:] if argv is None else argv)
-
-    if "--from-config" in argv:
-        return _run_from_config_non_interactive(argv)
-    if "--speed" in argv or "--bias" in argv:
-        return _non_interactive(argv)
-
+    load_settings()
+    if len(sys.argv) > 1:
+        print()
+        print("  这个程序不需要参数：直接回车、按数字选就行。")
     welcome()
     while True:
-        print()
-        for key, text in MENU.items():
-            print(f"  {key}) {text}")
-        choice = input("\n请输入数字后回车：").strip()
+        try:
+            print()
+            for key, text in MENU.items():
+                print(f"  {key}) {text}")
+            choice = input("\n请输入数字后回车：").strip()
 
-        if choice == "1":
-            action_compare_three()
-        elif choice == "2":
-            action_single()
-        elif choice == "3":
-            action_from_config()
-        elif choice == "4":
-            action_edit_config()
-        elif choice == "5":
-            do_report(DEFAULT_LOG_DIR, open_when_done=True)
-        elif choice == "6":
-            folder = Path(DEFAULT_LOG_DIR).resolve()
-            folder.mkdir(parents=True, exist_ok=True)
-            open_folder(folder)
-        elif choice == "7":
-            sub = ask(
-                "看哪个？",
-                {"1": "我能改什么（说明）", "2": "train.py 的全部参数"},
-                default="1",
-            )
-            if sub == "2":
-                action_list_options()
-            else:
+            if choice == "1":
+                action_compare_three()
+            elif choice == "2":
+                action_single()
+            elif choice == "3":
+                action_settings()
+            elif choice == "4":
+                action_show_settings()
+            elif choice == "5":
+                do_report(DEFAULT_LOG_DIR, open_when_done=True)
+            elif choice == "6":
+                action_analyze_bias()
+            elif choice == "7":
+                folder = Path(DEFAULT_LOG_DIR).resolve()
+                folder.mkdir(parents=True, exist_ok=True)
+                open_folder(folder)
+            elif choice == "8":
+                action_download()
+            elif choice == "9":
                 action_help()
-        elif choice == "8":
-            action_download()
-        elif choice in ("0", "q", "quit", "exit"):
-            print("\n  再见。结果都在 runs\\ 里面。\n")
+            elif choice in ("0", "q", "quit", "exit"):
+                print("\n  再见。结果都在 runs\\ 里面。\n")
+                return 0
+            else:
+                print(f"  没有 {choice!r} 这个选项，请输入 0-9")
+        except KeyboardInterrupt:
+            print("\n  （已取消，回到菜单）")
+        except EOFError:
+            # 输入流没了（终端被关掉、或用管道喂输入）：优雅退出，不要抛栈。
+            print("\n  输入结束了，退出。结果都在 runs\\ 里面。\n")
             return 0
-        else:
-            print(f"  没有 {choice!r} 这个选项，请输入 0-8")
-
-
-def _run_from_config_non_interactive(argv: list) -> int:
-    """``run.py --from-config [--dry-run]``：完全按 my_config.py 跑，不提问。"""
-    dry_run = "--dry-run" in argv
-    panel = read_my_config()
-    if not panel:
-        print("no usable my_config.py")
-        return 2
-    command = ["train"] + flags_to_argv(panel["flags"]) + list(panel["extra"])
-    if dry_run:
-        print("dry-run 命令：python main.py " + " ".join(command))
-        return 0
-    code = run_command(command)
-    if code != 0:
-        return code
-    do_report(str(panel["flags"].get("--log_dir", DEFAULT_LOG_DIR)))
-    return 0
-
-
-def _non_interactive(argv: list) -> int:
-    """给测试和脚本用的非交互模式：按给定设置跑，不做任何提问。"""
-    speed_key = "quick"
-    bias_preset = "b-gaussian"
-    epochs = None
-    dry_run = False
-    log_dir = DEFAULT_LOG_DIR
-    for index, item in enumerate(argv):
-        if item == "--speed" and index + 1 < len(argv):
-            speed_key = argv[index + 1]
-        elif item == "--bias" and index + 1 < len(argv):
-            bias_preset = argv[index + 1]
-        elif item == "--epochs" and index + 1 < len(argv):
-            epochs = int(argv[index + 1])
-        elif item == "--log_dir" and index + 1 < len(argv):
-            log_dir = argv[index + 1]
-        elif item == "--dry-run":
-            dry_run = True
-
-    try:
-        speed = speed_by_key(speed_key)
-    except KeyError:
-        print(f"unknown speed {speed_key!r}; choose from "
-              f"{[s['key'] for s in SPEEDS.values()]}")
-        return 2
-    if bias_preset not in BiasPresets:
-        print(f"unknown bias {bias_preset!r}; choose from {sorted(BiasPresets)}")
-        return 2
-    describe(speed, bias_preset, epochs or speed["epochs"], "egd", log_dir)
-    if dry_run:
-        print()
-        print("  dry-run 命令：python main.py " + " ".join(
-            build_train_command(
-                speed, bias_preset, run_name_for(speed["key"], bias_preset),
-                log_dir=log_dir, epochs=epochs,
-            )
-        ))
-        return 0
-    code = do_training(speed, bias_preset, epochs or speed["epochs"], "egd", log_dir)
-    if code != 0:
-        return code
-    do_report(log_dir)
-    return 0
 
 
 if __name__ == "__main__":

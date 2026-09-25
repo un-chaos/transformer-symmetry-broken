@@ -1,8 +1,9 @@
 """Tests for the evaluation helpers and the training entry point.
 
 These cover the metrics in ``symbreak_transformer/evaluate.py`` and the
-end-to-end behaviour of ``scripts/train.py`` driven through ``main.py``.  The
-BLEU expectations are hand-computed, not generated from the implementation:
+end-to-end behaviour of ``scripts/train.py``, which is the script the menu
+shells out to.  The BLEU expectations are hand-computed, not generated from the
+implementation:
 
 * ``perfect``   : p1=p2=p3=p4=1, lengths equal -> BP=1, BLEU=100
 * ``partial``   : p1=1/2, p2=1/3, p3=0, p4=0 with equal lengths and add-1
@@ -11,10 +12,10 @@ BLEU expectations are hand-computed, not generated from the implementation:
                   -> BP = exp(1 - 3/2) = 0.606531, BLEU = 60.6531
 
 The training loop lives in the script ``scripts/train.py``, so the end-to-end
-tests run ``python main.py train ...`` as a **real subprocess** and assert on the
-run directory it leaves behind.  That is the honest way to test a CLI-centric
-project: it exercises argparse, config resolution, the data pipeline, the
-optimizer and the checkpoint/log writing exactly as a user does.
+tests run it as a **real subprocess** and assert on the run directory it leaves
+behind.  That is the honest way to test this project: it exercises argparse, config
+resolution, the data pipeline, the optimizer and the checkpoint/log writing
+exactly as a real menu-driven run does.
 """
 
 from __future__ import annotations
@@ -307,9 +308,9 @@ ADAMW_RUN_FLAGS = [
 
 
 def train_command(tmp_path: Path, name: str, flags) -> list:
-    """The ``python main.py train ...`` command line for one subprocess run."""
+    """The command line for one subprocess run of the training script."""
     return [
-        sys.executable, str(ROOT / "main.py"), "train",
+        sys.executable, str(ROOT / "scripts" / "train.py"),
         *TRAIN_BASE_FLAGS,
         "--log_dir", str(tmp_path),
         "--name", name,
@@ -328,7 +329,7 @@ def read_losses(run_dir: Path) -> list:
 
 
 def test_train_end_to_end_runs(tmp_path: Path):
-    """Drive ``main.py train`` for real, once per optimizer, and check the artifacts.
+    """Drive the training script for real, once per optimizer, and check the artifacts.
 
     Both runs are launched **concurrently**: this repository's smoke run costs
     ~10 s of pure ``torch``/``wandb`` import before it does any work, so running
@@ -369,10 +370,10 @@ def test_train_end_to_end_runs(tmp_path: Path):
         except subprocess.TimeoutExpired:  # pragma: no cover - only on a hang
             proc.kill()
             out, _ = proc.communicate()
-            raise AssertionError(f"main.py train ({name}) timed out:\n{out[-4000:]}")
+            raise AssertionError(f"train.py ({name}) timed out:\n{out[-4000:]}")
         logs[name] = out
         assert proc.returncode == 0, (
-            f"main.py train ({name}) exited with {proc.returncode}:\n{out[-6000:]}"
+            f"train.py ({name}) exited with {proc.returncode}:\n{out[-6000:]}"
         )
 
     # ---------------- the EGD run: artifacts + logged bias norms ---------------- #

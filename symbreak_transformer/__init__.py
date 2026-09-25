@@ -15,11 +15,11 @@ Layout::
     model/           embedding, attention, feedforward, encoder, decoder, seq2seq
     data/            dataset download, tokenizer, batching
 
-Entry points live in ``scripts/`` and are driven by ``main.py``::
+Entry points live in ``scripts/`` and are driven by the single user-facing menu in
+``run.py`` (double-click ``run.bat``); nothing here is meant to be launched by
+hand::
 
-    python main.py train --model small --bias_preset b-gaussian --dataset_preset multi30k-tiny
-    python main.py evaluate --ckpt runs/<name>/model_best.pt
-    python main.py analyze-bias --ckpt runs/<name>/model_best.pt
+    run.bat            # or: python run.py   ->  numbered menu, no configuration
 """
 
 __version__ = "1.0.0"

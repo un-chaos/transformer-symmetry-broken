@@ -4,9 +4,9 @@ Configuration objects and model presets.
 Follows the layout of the companion project (``ecd_symbreak/config.py``): one
 plain dataclass describing the network shape, plus a ``PRESETS`` dict at the
 bottom selected from the command line with ``--model``.  Everything that is not
-part of the architecture (batch size, optimizer, data paths, ...) stays a
-command-line flag, and ``examples/*.sh`` archive a complete flag set per
-experiment.
+part of the architecture (batch size, optimizer, data paths, ...) is a plain
+field, and every field is reachable from the menu's parameter editor in
+``run.py`` -- nothing here is hard-coded from the user's point of view.
 
 One addition: ``BiasPresets`` names the symmetry-breaking settings, because the
 bias ``b`` is the knob this repository exists to study.  A preset can be picked
@@ -90,7 +90,7 @@ class DataConfig:
     synthetic_seed: int = 1234
 
     # --- source == "fineweb": a large monolingual corpus of parquet shards ---
-    #: Directory holding the shards.  ``python main.py download-data`` fills it.
+    #: Directory holding the shards.  Menu item 7) in run.py fills it.
     fineweb_dir: str = "data/fineweb-edu/sample-10BT"
     #: The column holding the document text.
     text_column: str = "text"
@@ -480,7 +480,7 @@ DATASET_PRESETS: Dict[str, Dict[str, Any]] = {
     "synthetic-copy": {"source": "synthetic", "synthetic_task": "copy"},
     "synthetic-reverse": {"source": "synthetic", "synthetic_task": "reverse"},
     "synthetic-sort": {"source": "synthetic", "synthetic_task": "sort"},
-    # --- the large monolingual corpus (needs `main.py download-data` first) ---
+    # --- the large monolingual corpus (download it from the menu first) ---
     #: FineWeb-Edu sample/10BT: ~10B tokens, 14 parquet shards, ~28.5 GB.  Trained
     #: with the denoising objective, because the corpus has no translations.
     "fineweb-10b": {

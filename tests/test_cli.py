@@ -1,9 +1,11 @@
-"""End-to-end tests through the command line.
+"""End-to-end tests of the pipeline the menu drives.
 
-These drive the real entry point (``main.py``) in a subprocess, which is the
-only way to test a CLI-centric project honestly: argparse wiring, the run
-directory layout, the CSV header and the checkpoint round trip are all exercised
-exactly as a user would exercise them.
+The project has exactly one user-facing entry point -- ``run.py``'s numbered menu
+(``tests/test_run_and_report.py`` covers it) -- so these tests drive the scripts
+that menu shells out to, in a subprocess. That is the only way to test a
+pipeline-centric project honestly: argparse wiring, the run directory layout, the
+CSV header and the checkpoint round trip are all exercised exactly as a real run
+exercises them.
 
 Kept deliberately small: one shared training run is reused by the evaluate /
 analyze / plot tests, and the bias-mode comparison uses 4-step runs.
@@ -12,7 +14,6 @@ analyze / plot tests, and the bias-mode comparison uses 4-step runs.
 from __future__ import annotations
 
 import json
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -20,8 +21,12 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-MAIN = ROOT / "main.py"
-EXAMPLES = ROOT / "examples"
+SCRIPTS = ROOT / "scripts"
+TRAIN = SCRIPTS / "train.py"
+EVALUATE = SCRIPTS / "evaluate.py"
+ANALYZE = SCRIPTS / "analyze_bias.py"
+PLOT = SCRIPTS / "plot_curve.py"
+REPORT = SCRIPTS / "report.py"
 
 #: A tiny, offline, CPU-cheap run used repeatedly below.
 SMOKE = [
@@ -35,10 +40,10 @@ SMOKE = [
 ]
 
 
-def run_cli(*args, timeout: int = 900) -> subprocess.CompletedProcess:
-    """Invoke ``main.py`` with the given arguments and capture its output."""
+def run_cli(script: Path, *args, timeout: int = 900) -> subprocess.CompletedProcess:
+    """Invoke one internal script with the given arguments and capture its output."""
     return subprocess.run(
-        [sys.executable, str(MAIN), *[str(a) for a in args]],
+        [sys.executable, str(script), *[str(a) for a in args]],
         cwd=str(ROOT),
         capture_output=True,
         text=True,
@@ -57,7 +62,7 @@ def trained_run(tmp_path_factory) -> Path:
     """One real training run (embedding bias + attention biases) shared below."""
     log_dir = tmp_path_factory.mktemp("cli_runs")
     result = run_cli(
-        "train", *SMOKE,
+        TRAIN, *SMOKE,
         "--bias_preset", "b-gaussian",
         "--use_q_bias", "--use_v_bias",
         "--log_dir", str(log_dir),
@@ -70,23 +75,26 @@ def trained_run(tmp_path_factory) -> Path:
 
 
 # --------------------------------------------------------------------------- #
-# Dispatch / help
+# One entry point, and only one
 # --------------------------------------------------------------------------- #
-def test_help_lists_every_command():
-    result = run_cli("--help")
-    assert result.returncode == 0, joined(result)
-    for command in ("train", "evaluate", "analyze-bias", "plot"):
-        assert command in result.stdout
+def test_the_menu_is_the_only_root_entry_point():
+    """No second way in: no dispatcher script, no shell examples, no config file.
 
-
-def test_unknown_command_is_rejected():
-    result = run_cli("frobnicate")
-    assert result.returncode == 2
-    assert "unknown command" in joined(result)
+    This is a deliberate product decision -- a single foolproof usage -- so it is
+    pinned here: reintroducing an alternative entry point breaks this test.
+    """
+    assert (ROOT / "run.py").is_file()
+    assert (ROOT / "run.bat").is_file()
+    for gone in ("main.py", "my_config.py"):
+        assert not (ROOT / gone).exists(), f"{gone} is a second entry point"
+    assert not (ROOT / "examples").exists(), "examples/ is a second usage"
+    root_python = sorted(p.name for p in ROOT.glob("*.py"))
+    assert root_python == ["conftest.py", "run.py"], root_python
 
 
 def test_train_list_models_prints_the_presets():
-    result = run_cli("train", "--list_models")
+    """The preset table the menu's choices are built from actually renders."""
+    result = run_cli(TRAIN, "--list_models")
     assert result.returncode == 0, joined(result)
     for name in ("smoke", "tiny", "small", "base", "large"):
         assert name in result.stdout
@@ -94,21 +102,36 @@ def test_train_list_models_prints_the_presets():
         assert name in result.stdout
 
 
-def test_every_flag_used_in_examples_exists():
-    """Guard against flag drift between examples/*.sh and scripts/train.py."""
-    help_text = joined(run_cli("train", "--help"))
-    documented = set(re.findall(r"--[A-Za-z0-9_]+", help_text))
-    assert "--model" in documented
+def test_every_source_file_is_tracked_by_git():
+    """A fresh clone must be runnable: .gitignore may not hide source code.
 
-    scripts = sorted(EXAMPLES.glob("*.sh"))
-    assert scripts, "no example scripts found"
-    problems = []
-    for script in scripts:
-        used = set(re.findall(r"--[A-Za-z0-9_]+", script.read_text(encoding="utf-8")))
-        missing = sorted(used - documented)
-        if missing:
-            problems.append(f"{script.name}: {missing}")
-    assert not problems, "examples use flags train.py does not accept: " + "; ".join(problems)
+    This is a regression guard for a real bug: an unanchored ``data/`` rule also
+    matched ``symbreak_transformer/data/``, so the entire data subpackage (the
+    tokenizers, the datasets, the downloaders) was silently missing from the
+    repository while every local test still passed.
+    """
+    try:
+        listed = subprocess.run(
+            ["git", "ls-files"], cwd=str(ROOT), capture_output=True,
+            text=True, encoding="utf-8", errors="replace", timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover
+        pytest.skip("git is not available")
+    if listed.returncode != 0:  # pragma: no cover - not a checkout (e.g. sdist)
+        pytest.skip("not a git checkout")
+
+    tracked = {line.strip().replace("\\", "/") for line in listed.stdout.splitlines()}
+    source = sorted(
+        path.relative_to(ROOT).as_posix()
+        for pattern in ("*.py", "scripts/*.py", "tests/*.py", "symbreak_transformer/**/*.py")
+        for path in ROOT.glob(pattern)
+    )
+    assert source, "no source files found to check"
+    missing = [name for name in source if name not in tracked]
+    assert not missing, (
+        "these source files are absent from the repository (check .gitignore "
+        f"for an unanchored rule): {missing}"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -166,7 +189,7 @@ def test_checkpoint_carries_dict_configs(trained_run: Path):
 # --------------------------------------------------------------------------- #
 def test_evaluate_scores_a_checkpoint(trained_run: Path):
     result = run_cli(
-        "evaluate",
+        EVALUATE,
         "--ckpt", trained_run / "model_best.pt",
         "--split", "test",
         "--max_samples", "32",
@@ -184,7 +207,7 @@ def test_evaluate_scores_a_checkpoint(trained_run: Path):
 def test_analyze_bias_measures_a_non_zero_effect(trained_run: Path, tmp_path: Path):
     out = tmp_path / "bias_comparison.json"
     result = run_cli(
-        "analyze-bias",
+        ANALYZE,
         "--ckpt", trained_run / "model_best.pt",
         "--split", "test",
         "--batches", "2",
@@ -207,7 +230,7 @@ def test_analyze_bias_measures_a_non_zero_effect(trained_run: Path, tmp_path: Pa
 
 
 def test_plot_writes_a_png(trained_run: Path):
-    result = run_cli("plot", "--run", trained_run)
+    result = run_cli(PLOT, "--run", trained_run)
     assert result.returncode == 0, joined(result)
     png = trained_run / "training_curve.png"
     if not png.exists():
@@ -216,9 +239,9 @@ def test_plot_writes_a_png(trained_run: Path):
 
 
 def test_report_compares_the_finished_runs(trained_run: Path):
-    """`main.py report` turns a log directory into one report + one figure."""
+    """The report script turns a log directory into one report + one figure."""
     log_dir = trained_run.parent
-    result = run_cli("report", "--log_dir", log_dir)
+    result = run_cli(REPORT, "--log_dir", log_dir)
     assert result.returncode == 0, joined(result)
 
     out = log_dir / "_compare"
@@ -242,7 +265,7 @@ def test_bias_modes_train_and_log_the_expected_bias(
 ):
     log_dir = tmp_path / "runs"
     result = run_cli(
-        "train",
+        TRAIN,
         "--model", "smoke",
         "--dataset_preset", "synthetic-copy",
         "--batch_size", "16",
@@ -276,7 +299,7 @@ def test_bias_modes_train_and_log_the_expected_bias(
 def test_attention_bias_presets_train_end_to_end(tmp_path: Path):
     log_dir = tmp_path / "runs"
     result = run_cli(
-        "train",
+        TRAIN,
         "--model", "smoke",
         "--dataset_preset", "synthetic-copy",
         "--batch_size", "16",
@@ -319,12 +342,12 @@ def test_resume_continues_from_a_checkpoint(tmp_path: Path):
         "--no_plot",
     ]
 
-    first = run_cli("train", *base, "--max_steps", "6")
+    first = run_cli(TRAIN, *base, "--max_steps", "6")
     assert first.returncode == 0, joined(first)
     ckpt = log_dir / "resumed" / "model_final.pt"
     assert ckpt.exists(), sorted(p.name for p in (log_dir / "resumed").iterdir())
 
-    second = run_cli("train", *base, "--max_steps", "12", "--resume", ckpt)
+    second = run_cli(TRAIN, *base, "--max_steps", "12", "--resume", ckpt)
     assert second.returncode == 0, joined(second)
     assert "[resume]" in joined(second), "the resume was not reported"
 
@@ -343,7 +366,7 @@ def test_resume_warns_but_continues_on_a_bad_checkpoint(tmp_path: Path):
     log_dir = tmp_path / "runs"
     missing = tmp_path / "not-a-checkpoint.pt"
     result = run_cli(
-        "train",
+        TRAIN,
         "--model", "smoke",
         "--dataset_preset", "synthetic-copy",
         "--batch_size", "16",

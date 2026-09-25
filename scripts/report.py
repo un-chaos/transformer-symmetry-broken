@@ -54,9 +54,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-# `main.py` dispatches through ``runpy.run_path``, which -- unlike running this
-# file directly -- does not put this directory on ``sys.path``, so the same
-# guard ``scripts/evaluate.py`` uses is repeated here.
+# This script is invoked by ``run.py``'s menu (the project's single entry point),
+# which imports this package rather than putting ``scripts/`` on ``sys.path``, so
+# the sibling module is imported explicitly -- same guard as ``scripts/evaluate.py``.
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
@@ -822,19 +822,9 @@ def _reading_guide(runs: Sequence[Dict[str, Any]]) -> List[str]:
 
     if len(ranked) == 1:
         item("现在只有 1 次运行有验证曲线，没有第二个可以对比，所以看不出偏置到底有没有效果。")
-        item("想看出「对称性破缺偏置」的效果，至少要有两次只差偏置设置的运行，例如：")
-        lines.append(
-            "       python main.py train --model small --dataset_preset multi30k-tiny "
-            "--bias_preset symmetric  --name small-egd-symmetric"
-        )
-        lines.append(
-            "       python main.py train --model small --dataset_preset multi30k-tiny "
-            "--bias_preset b-gaussian --name small-egd-bgaussian"
-        )
-        lines.append(
-            "     两次都用同样的模型、同样的数据、同样的步数，只改 --bias_preset，"
-            "跑完后重新执行本脚本即可。"
-        )
+        item("想看出「对称性破缺偏置」的效果，至少要有两次只差偏置设置的运行：")
+        item("回菜单选 1)（三种 bias 各跑一次，自动对比），或者选 2) 换一种 bias 再跑一次。")
+        item("两次会自动用同样的模型、同样的数据、同样的步数，只改偏置设置。")
         return lines
 
     second = ranked[1]
@@ -937,7 +927,7 @@ def _explanation(
     lines.append("    训练损失（train_loss）是训练集上的滑动平均，只作参考，不能和验证损失直接比大小。")
     lines.append(
         "  - 「最佳验证损失」取 training_log.csv 里 val_loss 的最小值；"
-        "「测试损失/BLEU」来自 eval_test.json（用 evaluate 子命令生成），没有就显示 "
+        "「测试损失/BLEU」来自 eval_test.json（每次训练结束后会自动算一次），没有就显示 "
         f"{MISSING}。"
     )
     lines.append(
@@ -1021,10 +1011,9 @@ def _no_run_report(
             "怎么看",
             "------",
             "  1. 这份报告只统计「已经跑完并写下 training_log.csv」的运行。",
-            "  2. 先训练一次（例如）：",
-            "       python main.py train --model smoke --dataset_preset synthetic-reverse "
-            "--max_steps 60",
-            "  3. 训练结束后，运行目录里会出现 training_log.csv，再执行本脚本就能看到对比。",
+            "  2. 先回菜单跑一次：选 1)（三种 bias 做对比）或 2)（只跑一种）。",
+            "     「玩具任务」不用联网，约 15 秒就能跑完一次。",
+            "  3. 训练结束后，运行目录里会出现 training_log.csv，再回菜单选 5) 就能看到对比。",
             "",
             "说明",
             "----",

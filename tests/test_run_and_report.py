@@ -31,6 +31,24 @@ LOG_HEADER = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def isolated_menu_state(tmp_path, monkeypatch):
+    """Every test gets a fresh menu state and its own settings file.
+
+    The menu keeps its choices in module globals, so without this one test's
+    "user picked speed 3" would leak into the next one.
+    """
+    monkeypatch.setattr(runpy_menu, "SETTINGS_FILE", tmp_path / "run_settings.json")
+    saved_state, saved_custom = dict(runpy_menu.STATE), dict(runpy_menu.CUSTOM)
+    runpy_menu.STATE.update({"speed": "1", "bias": "b-gaussian", "optimizer": "egd"})
+    runpy_menu.CUSTOM.clear()
+    yield
+    runpy_menu.STATE.clear()
+    runpy_menu.STATE.update(saved_state)
+    runpy_menu.CUSTOM.clear()
+    runpy_menu.CUSTOM.update(saved_custom)
+
+
 @pytest.fixture(scope="module")
 def report():
     """Load ``scripts/report.py`` without putting ``scripts/`` on sys.path."""
@@ -158,12 +176,12 @@ def test_speeds_always_set_the_logging_cadence():
 # run.py: command construction
 # --------------------------------------------------------------------------- #
 def test_build_train_command_carries_every_setting():
-    speed = runpy_menu.SPEEDS["2"]
-    command = runpy_menu.build_train_command(
-        speed, "b-gaussian", "quick-bgaussian", log_dir="myruns", epochs=3
-    )
-    assert command[0] == "train"
+    runpy_menu.STATE.update({"speed": "2", "bias": "b-gaussian", "optimizer": "egd"})
+    runpy_menu.CUSTOM.update({"--epochs": 3, "--log_dir": "myruns"})
+    command = runpy_menu.build_train_command(runpy_menu.effective_flags())
+
     joined = " ".join(command)
+    speed = runpy_menu.SPEEDS["2"]
     for expected in (
         "--model tiny",
         "--dataset_preset multi30k-quick",
@@ -176,6 +194,9 @@ def test_build_train_command_carries_every_setting():
         f"--valid_every_updates {speed['valid_every']}",
     ):
         assert expected in joined, f"{expected!r} missing from {command}"
+    # There is no subcommand layer any more: the menu calls the training script
+    # directly, so the first element is a flag.
+    assert command[0].startswith("--")
     # The loss curve must always be written: --no_plot would suppress it.
     assert "--no_plot" not in command, (
         "the menu path must save training_curve.png, so it must not pass --no_plot"
@@ -183,19 +204,19 @@ def test_build_train_command_carries_every_setting():
 
 
 def test_menu_never_disables_plotting_for_any_speed():
-    for key, speed in runpy_menu.SPEEDS.items():
-        command = runpy_menu.build_train_command(speed, "symmetric", f"{key}-x")
+    for key in runpy_menu.SPEEDS:
+        runpy_menu.STATE["speed"] = key
+        command = runpy_menu.build_train_command(runpy_menu.effective_flags())
         assert "--no_plot" not in command, f"speed {key} would skip the loss curve"
 
 
 def test_build_train_command_only_adds_max_steps_when_set():
-    toy = runpy_menu.build_train_command(
-        runpy_menu.SPEEDS["1"], "b-const", "toy-bconst"
-    )
+    runpy_menu.STATE["speed"] = "1"          # toy: step-capped
+    toy = runpy_menu.build_train_command(runpy_menu.effective_flags())
     assert "--max_steps" in toy
-    long = runpy_menu.build_train_command(
-        runpy_menu.SPEEDS["3"], "b-const", "long-bconst"
-    )
+
+    runpy_menu.STATE["speed"] = "3"          # long: bounded by epochs instead
+    long = runpy_menu.build_train_command(runpy_menu.effective_flags())
     assert "--max_steps" not in long, "a full-length run must not cap its steps"
 
 
@@ -205,83 +226,139 @@ def test_run_name_encodes_the_choices():
     assert runpy_menu.run_name_for("toy", "b-const", "adamw") == "toy-bconst-adamw"
 
 
-def test_speed_by_key_round_trips_and_rejects_unknown():
-    for speed in runpy_menu.SPEEDS.values():
-        assert runpy_menu.speed_by_key(speed["key"]) is speed
-    with pytest.raises(KeyError):
-        runpy_menu.speed_by_key("glacial")
+def test_current_speed_follows_the_state():
+    for key in runpy_menu.SPEEDS:
+        runpy_menu.STATE["speed"] = key
+        assert runpy_menu.current_speed() is runpy_menu.SPEEDS[key]
 
 
 def test_report_and_evaluate_commands_are_shaped_correctly():
     report_command = runpy_menu.build_report_command("myruns")
-    assert report_command[:2] == ["report", "--log_dir"]
+    assert report_command[:2] == ["--log_dir", "myruns"]
     evaluate_command = runpy_menu.build_evaluate_command(
         Path("myruns/x/model_best.pt"), "multi30k-quick"
     )
-    assert evaluate_command[0] == "evaluate"
     assert "--data" not in evaluate_command
     assert "multi30k-quick" in evaluate_command
+    assert "--ckpt" in evaluate_command
+
+
+def test_the_menu_scripts_all_exist():
+    """Every script the menu shells out to must be present and named right."""
+    for script in (
+        runpy_menu.TRAIN_SCRIPT,
+        runpy_menu.EVALUATE_SCRIPT,
+        runpy_menu.REPORT_SCRIPT,
+        runpy_menu.DOWNLOAD_SCRIPT,
+        runpy_menu.ANALYZE_SCRIPT,
+    ):
+        assert script.is_file(), f"{script} is missing"
+
+
+def test_the_menu_numbers_every_feature():
+    """Renumbering the menu is fine; losing an item off the end is not."""
+    assert set(runpy_menu.MENU) == {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9"}
+    labels = " ".join(runpy_menu.MENU.values())
+    for feature in ("三种 bias", "只跑一种", "修改训练设置", "当前设置",
+                    "已有结果", "分析 bias", "结果文件夹", "下载", "帮助"):
+        assert feature in labels, f"the menu no longer offers: {feature}"
 
 
 # --------------------------------------------------------------------------- #
-# run.py: my_config.py handling
+# run.py: the bias-analysis item
 # --------------------------------------------------------------------------- #
-def test_my_config_round_trip(tmp_path: Path):
-    path = tmp_path / "my_config.py"
-    flags = {
-        "--model": "long",
-        "--bias_preset": "attn-bQbV",
-        "--epochs": 3,
-        "--optimizer": "adamw",
-        "--log_dir": "results",
-    }
-    runpy_menu.write_my_config(flags, path)
-    text = path.read_text(encoding="utf-8")
-    assert "FORMAT = 2" in text
-    assert "SETTINGS" in text
-    assert "EXTRA_ARGS" in text
-    # The panel must document every knob the training script accepts, so a user
-    # can find anything rather than being limited to a hand-picked subset.
-    assert "--noise_density" in text
-    assert "--prelu_slope_mean" in text
-    assert "--no_apply_encoder" in text
+def test_finished_runs_lists_only_trained_runs(tmp_path: Path):
+    log_dir = tmp_path / "runs"
+    for name, with_ckpt in (("trained", True), ("interrupted", False)):
+        (log_dir / name).mkdir(parents=True)
+        if with_ckpt:
+            (log_dir / name / "model_best.pt").write_bytes(b"x")
+    (log_dir / "not-a-dir.txt").write_text("x", encoding="utf-8")
+    assert [p.name for p in runpy_menu.finished_runs(str(log_dir))] == ["trained"]
 
-    panel = runpy_menu.read_my_config(path)
-    assert panel is not None
-    for flag, value in flags.items():
-        assert panel["flags"][flag] == value
-    assert panel["extra"] == []
-    assert sorted(runpy_menu.flags_to_argv(panel["flags"])) == sorted(
-        runpy_menu.flags_to_argv(flags)
+
+def test_finished_runs_on_a_missing_directory_is_empty(tmp_path: Path):
+    assert runpy_menu.finished_runs(str(tmp_path / "nope")) == []
+
+
+def test_dataset_preset_is_read_back_from_the_run(tmp_path: Path):
+    """The analysis must use the data the checkpoint was trained on."""
+    run_dir = tmp_path / "r"
+    run_dir.mkdir()
+    (run_dir / "args.json").write_text(
+        json.dumps({"dataset_preset": "multi30k-tiny"}), encoding="utf-8"
+    )
+    assert runpy_menu.dataset_preset_of(run_dir) == "multi30k-tiny"
+
+    (run_dir / "args.json").unlink()          # missing file: fall back, never raise
+    assert runpy_menu.dataset_preset_of(run_dir) == (
+        runpy_menu.effective_flags()["--dataset_preset"]
     )
 
 
-def test_my_config_honours_extra_args(tmp_path: Path):
-    path = tmp_path / "my_config.py"
-    runpy_menu.write_my_config({"--model": "tiny"}, path, extra=["--seed", "7"])
-    panel = runpy_menu.read_my_config(path)
-    assert panel["extra"] == ["--seed", "7"]
+def test_analyze_command_points_at_the_chosen_run(tmp_path: Path):
+    run_dir = tmp_path / "quick-bgaussian"
+    command = runpy_menu.build_analyze_command(run_dir, "multi30k-quick")
+    joined_command = " ".join(command)
+    assert "model_best.pt" in joined_command
+    assert "multi30k-quick" in joined_command
+    assert "--out" in command and "bias_analysis.json" in joined_command
+    assert "--no_plot" not in command, "the analysis should still draw its figure"
 
 
-def test_control_panel_is_not_overwritten(tmp_path: Path, monkeypatch):
-    """A hand-tuned panel must survive a later menu run."""
-    target = tmp_path / "my_config.py"
-    runpy_menu.write_my_config({"--model": "base"}, target)
-    before = target.read_text(encoding="utf-8")
-    monkeypatch.setattr(runpy_menu, "MY_CONFIG", target)
-    runpy_menu.maybe_write_panel({"--model": "tiny"})
-    assert target.read_text(encoding="utf-8") == before
+def test_analyze_on_an_empty_runs_directory_says_so(tmp_path, capsys, monkeypatch):
+    """With nothing trained yet the item must explain itself, not crash."""
+    monkeypatch.setattr(runpy_menu, "finished_runs", lambda log_dir="runs": [])
+    runpy_menu.action_analyze_bias()
+    assert "还没有训练好的模型" in capsys.readouterr().out
 
 
-def test_read_my_config_survives_a_broken_file(tmp_path: Path):
-    """The docs promise a hand-broken file cannot break the menu."""
-    path = tmp_path / "my_config.py"
-    path.write_text('SPEED = "quick\nBIAS = \n', encoding="utf-8")  # unbalanced quote
-    assert runpy_menu.read_my_config(path) is None
+# --------------------------------------------------------------------------- #
+# run.py: dry runs and menu robustness
+# --------------------------------------------------------------------------- #
+def test_dry_run_touches_nothing(tmp_path: Path):
+    """A dry run must print the command and create no run directory."""
+    runpy_menu.CUSTOM["--log_dir"] = str(tmp_path / "runs")
+    code = runpy_menu.do_training(runpy_menu.effective_flags(), dry_run=True)
+    assert code == 0
+    assert not (tmp_path / "runs").exists()
 
 
-def test_read_my_config_missing_file_is_none(tmp_path: Path):
-    assert runpy_menu.read_my_config(tmp_path / "nope.py") is None
+def test_an_unknown_menu_choice_is_rejected_and_the_menu_continues(monkeypatch, capsys):
+    """A typo must not crash and must not exit the menu."""
+    answers = iter(["zz", "0"])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(answers))
+    assert runpy_menu.main() == 0
+    assert "没有 'zz' 这个选项" in capsys.readouterr().out
+
+
+def test_the_menu_exits_cleanly_when_input_ends(monkeypatch):
+    """Piping input (or closing the terminal) must not raise EOFError."""
+    def no_more_input(*args, **kwargs):
+        raise EOFError
+    monkeypatch.setattr("builtins.input", no_more_input)
+    assert runpy_menu.main() == 0
+
+
+def test_the_menu_ignores_command_line_arguments(monkeypatch, capsys):
+    """There is exactly one usage: extra arguments must not unlock another one."""
+    answers = iter(["0"])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(answers))
+    monkeypatch.setattr("sys.argv", ["run.py", "--speed", "quick"])
+    assert runpy_menu.main() == 0
+    assert "不需要参数" in capsys.readouterr().out
+
+
+def test_settings_are_remembered_when_a_run_is_configured(tmp_path, monkeypatch):
+    """Choosing in the menu writes the state file, so the choice survives a restart."""
+    monkeypatch.setattr(runpy_menu, "SETTINGS_FILE", tmp_path / "run_settings.json")
+    runpy_menu.STATE.update({"speed": "3", "bias": "b-const"})
+    runpy_menu.save_settings()
+
+    runpy_menu.STATE.update({"speed": "1", "bias": "b-gaussian"})
+    runpy_menu.load_settings()
+    assert runpy_menu.STATE["speed"] == "3"
+    assert runpy_menu.STATE["bias"] == "b-const"
 
 
 def test_triple_duration_keeps_the_unit():
@@ -291,25 +368,6 @@ def test_triple_duration_keeps_the_unit():
     assert runpy_menu._triple("约 15 秒") == "约 45 秒"
     assert runpy_menu._triple("约 30 秒") == "约 1 分钟"
     assert runpy_menu._triple("很快") == "很快"
-
-
-def test_dry_run_touches_nothing(tmp_path: Path):
-    """`--dry-run` must print the command and create no run directory."""
-    code = runpy_menu.main(
-        [
-            "--speed", "toy",
-            "--bias", "b-const",
-            "--dry-run",
-            "--log_dir", str(tmp_path / "runs"),
-        ]
-    )
-    assert code == 0
-    assert not (tmp_path / "runs").exists()
-
-
-def test_non_interactive_rejects_an_unknown_bias(tmp_path: Path):
-    code = runpy_menu.main(["--bias", "not-a-bias", "--dry-run"])
-    assert code == 2
 
 
 # --------------------------------------------------------------------------- #

@@ -34,9 +34,9 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-# `main.py` dispatches through ``runpy.run_path``, which -- unlike running this
-# file directly -- does not put this directory on ``sys.path``, so the
-# script-local ``_common`` helper needs it added explicitly.
+# This script is invoked by ``run.py``'s menu (the project's single entry point),
+# which imports this package rather than putting ``scripts/`` on ``sys.path``, so
+# the script-local ``_common`` helper needs it added explicitly.
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)

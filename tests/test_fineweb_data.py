@@ -536,14 +536,15 @@ def test_dataset_getitem_is_deterministic(config, tokenizer):
 
 
 def test_dataset_missing_shard_message(tmp_path, tokenizer):
+    """The error tells the user where to get the corpus: the menu, not a command."""
     cfg = _cfg(tmp_path / "empty", max_documents=10)
     with pytest.raises(FileNotFoundError) as excinfo:
         FineWebDenoisingDataset(cfg, tokenizer, split="train")
-    assert "download-data" in str(excinfo.value)
+    assert "menu item 7" in str(excinfo.value)
 
     with pytest.raises(FileNotFoundError) as excinfo:
         build_bpe_tokenizer(_cfg(tmp_path / "empty2"))
-    assert "download-data" in str(excinfo.value)
+    assert "menu item 7" in str(excinfo.value)
 
 
 def test_dataset_items_satisfy_collate_batch_contract(config, tokenizer):

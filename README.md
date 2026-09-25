@@ -2,10 +2,11 @@
 
 ## 快速上手（中文）
 
-不想碰命令行、不想读代码的话：**双击 `run.bat`**，然后按提示输入数字就行。
+**这个项目只有一种用法**：**双击 `run.bat`**（或者运行 `python run.py`，完全一样），
+然后按提示输入数字。
 
 ```
-双击 run.bat  →  输入 1（跑三种 bias 做对比）  →  输入 1（玩具任务，15 秒，不用联网）
+双击 run.bat  →  输入 1（跑三种 bias 做对比）  →  回车（玩具任务，15 秒，不用联网）
 ```
 
 跑完会自动生成对比图和一份中文报告：
@@ -20,15 +21,16 @@
 - `model_summary.txt` —— 模型说明书：结构、维度、参数量花在哪
 - `training_log.csv` / `config.json` / `bias.json` / `args.json` / 模型权重
 
-**想自由调初始参数**（模型大小、学习率、batch size、数据集……）：选菜单 `4`
-打开 `my_config.py`，里面 `SETTINGS` 每一项都是真实的命令行参数，改完保存，
-选菜单 `3` 就跑。**没有任何参数是写死的**；文件底部有一份从 `train.py`
-自动生成的完整参数清单，菜单 `7` 也能直接查看。
+**想自由调初始参数**（模型大小、学习率、batch size、数据集……）：选菜单 `3`，
+它会列出当前设置，输入编号就能改 —— **没有任何参数是写死的**，
+`train.py` 支持多少参数（100 多项）就能改多少，选 `a` 看全部。
+改过的项会被自动记住，不需要编辑任何文件。
 
 **想用大规模语料**（FineWeb-Edu 10B，约 28.5 GB）：选菜单 `8` 下载
-（断点续传，会另开一个窗口显示进度），然后把「跑多久」选成 `4`，
-或在 `my_config.py` 里写 `"--dataset_preset": 'fineweb-10b'` 配
-`"--objective": 'denoising'`。
+（断点续传，会另开一个窗口显示进度），然后在菜单 `3` 里把 `--dataset_preset`
+改成 `fineweb-10b`（或先试 `fineweb-quick`）。
+
+**没有第二个入口、没有要手改的配置文件、不需要懂代码。**
 
 **完整中文说明见 [`使用说明.md`](使用说明.md)**（包含常见问题、名词解释、
 每种 bias 是什么意思、结果怎么看、模型说明书怎么读、大数据怎么下）。
@@ -48,24 +50,36 @@ measures how much the injected bias actually changes what the model computes,
 and a comparison report that turns a directory full of runs into one figure and
 one table.
 
-The layout, the configuration style (`config.py` presets + command-line flags +
-`examples/*.sh`), the run-output conventions and the training-script shape follow
-the companion project
+The layout, the configuration style (`config.py` presets + a flat set of named
+parameters), the run-output conventions and the training-script shape follow the
+companion project
 [`evasilverstein/Symmetry-breaking-attention-bias`](https://github.com/evasilverstein/Symmetry-breaking-attention-bias),
 which studies the same physics on a decoder-only GPT. AI coding assistance
 contributed substantially to this package, including code generation and
 facilitating testing and analysis.
 
-### Two ways to drive it
+### One way to drive it
 
-| | for | how |
-|---|---|---|
-| **Foolproof** | running the bias comparison without touching code | double-click `run.bat`, or `python run.py`, and answer the numbered menu |
-| **Scriptable** | scripting, sweeping, reproducing a published setting | `python main.py <command> [flags]`, or `examples/*.sh` |
+There is exactly **one** user-facing entry point, and deliberately so:
 
-`run.py` is a thin front-end: it asks a couple of questions, then invokes
-`main.py` for you and shows the comparison report at the end. Anything it can do
-you can also do by hand — see "Quick Start" below.
+```
+double-click run.bat          # or: python run.py   (identical)
+        ↓
+numbered Chinese menu  →  answer with digits  →  results land in runs/
+```
+
+Every capability is a menu item: training (1, 2), free configuration of any
+parameter (3, 4), re-reporting finished runs (5), measuring what the bias actually
+does (6), the results folder (7), downloading the large corpus (8) and help (9). There is no second entry point —
+no dispatcher script, no shell-script archive, no config file to hand-edit — and
+`tests/test_cli.py::test_the_menu_is_the_only_root_entry_point` fails if one is
+reintroduced.
+
+Parameters are *not* hard-coded behind the menu: menu item 3) edits every flag
+`scripts/train.py` accepts (~128 of them, listed straight from its argparse), and
+remembers the edits in a generated `run_settings.json` the user never opens. The
+internal scripts under `scripts/` are implementation detail, invoked by the menu
+for isolation (a crash returns to the menu rather than killing it).
 
 ## Key Idea
 
@@ -127,84 +141,66 @@ training script accepts `--optimizer egd|adamw|sgdm`.
 
 ## Quick Start
 
+Everything below is done from the menu; the parameter names are the ones menu 3)
+shows and lets you change.
+
 ### The three bias modes (the experiment this repo exists for)
 
-```bash
-# control: b = 0, O(n_embd) is an exact symmetry
-python main.py train --model small --dataset_preset multi30k-tiny \
-    --bias_preset symmetric --name small-egd-symmetric
+Menu **1)** runs all three back to back with otherwise identical settings and then
+draws the comparison — that is the whole experiment, and it is the reason the
+foolproof path exists:
 
-# b ~ N(0, 0.02^2), drawn once at initialisation
-python main.py train --model small --dataset_preset multi30k-tiny \
-    --bias_preset b-gaussian --name small-egd-bgaussian
-
-# b = 1 in every dimension
-python main.py train --model small --dataset_preset multi30k-tiny \
-    --bias_preset b-const --name small-egd-bconst
+```
+menu 1)  →  pick how long  →  enter
+   b = 0            control: O(n_embd) is an exact symmetry
+   b ~ N(0, 0.02^2) drawn once at initialisation
+   b = 1            in every dimension
 ```
 
-The same runs can be reproduced from the archived flag sets in `examples/`:
-
-```bash
-bash examples/train_symmetric.sh
-bash examples/train_b_gaussian.sh
-bash examples/train_b_const.sh
-```
-
-(On Windows these need Git Bash, which ships with Git for Windows; `bash` is
-usually at `C:\Program Files\Git\bin\bash.exe` and may not be on `PATH`. Every
-example is a single `python` invocation, so it can also be run by copying the
-flags onto `python main.py train` directly.)
+To run a single mode instead, use menu **2)** and pick the bias. Anyone who wants
+a different model size or step budget changes it first in menu **3)**
+(`--model`, `--dataset_preset`, `--max_steps`, …), then runs 1) or 2).
 
 ### Reference-style per-head attention biases
 
-```bash
-python main.py train --model small --dataset_preset multi30k-tiny \
-    --optimizer egd --egd_lr 1.0 --egd_eta 100 --egd_F0 -1.0 \
-    --use_q_bias --use_v_bias --mean_Q 0.5 --std_Q 0.05 --mean_V 0.5 --std_V 0.05 \
-    --name small-egd-bQbV
-```
+Menu **3)** → set `--bias_preset` to `attn-bQbV` (or `attn-full` for bQ+bK+bV).
+The individual knobs (`--use_q_bias`, `--use_v_bias`, `--mean_Q`, `--std_Q`,
+`--mean_V`, `--std_V`) are in the same editor under group "symmetry-breaking
+bias", and `a)` on that screen lists all of them.
 
 ### AdamW baseline
 
-```bash
-python main.py train --model small --dataset_preset multi30k-tiny \
-    --optimizer adamw --adam_lr 1e-3 --adam_wd 0.01 \
-    --bias_preset symmetric --name small-adamw-symmetric
-```
+Menu **3)** → `--optimizer` → `adamw`, plus `--adam_lr` / `--adam_wd`. Then run
+menu 2) with `--bias_preset` = `symmetric` to get the conventional baseline the
+EGD runs are compared against.
 
 ### Offline smoke test (no network, well under a minute)
 
-```bash
-python main.py train --model smoke --dataset_preset synthetic-reverse --max_steps 60
-```
+Menu **1)** or **2)** → "玩具任务" (the toy task). It is synthetic, needs no
+network and takes about 15 seconds per run.
 
 ### Evaluation and bias analysis
 
-```bash
-# loss + corpus BLEU on a split
-python main.py evaluate --ckpt runs/small-egd-bgaussian/model_best.pt \
-    --split test --dataset_preset multi30k-tiny --show_samples 5
+Both happen from the menu:
 
-# how much does the injected bias actually change the model?
-python main.py analyze-bias --ckpt runs/small-egd-bgaussian/model_best.pt
-
-# compare the three modes side by side
-python main.py analyze-bias \
-    --ckpt runs/small-egd-symmetric/model_best.pt \
-           runs/small-egd-bgaussian/model_best.pt \
-           runs/small-egd-bconst/model_best.pt
-
-# plot a finished run
-python main.py plot --run runs/small-egd-bgaussian
-```
+- after training, the menu scores the best checkpoint (test loss + corpus BLEU)
+  and stores it as `eval_test.json` inside the run directory;
+- menu **5)** re-scans every finished run and rewrites the comparison figure,
+  table and Chinese report into `<log_dir>/_compare/`;
+- menu **6)** measures the bias itself: it picks a finished run and re-runs the
+  model with the injected bias zeroed, reporting `logit_rel_change` (how much the
+  output moved) as `bias_analysis.json` inside that run directory. A larger number
+  means the model actually uses the bias, which is the quantitative half of the
+  "is the symmetry breaking doing anything?" question.
 
 ### What is available
 
-```bash
-python main.py --help                # the subcommands
-python main.py train --list_models   # model / bias / dataset presets + parameter counts
-```
+Menu **3)** → `a)` prints every parameter `scripts/train.py` accepts, grouped,
+with its default and its help text. Menu **9)** explains what each menu item does.
+The preset tables (model sizes, bias presets, dataset presets and their parameter
+counts) are printed by the training script's `--list_models`, which the menu does
+not need to expose because the same names are offered as numbered choices in the
+editor.
 
 ## Training Output and Logging
 
@@ -299,34 +295,27 @@ plt.savefig("training_curve.png")
 ### Resuming an interrupted run
 
 A CPU run is long enough that losing it to an interruption hurts, so training can
-pick up from a checkpoint:
-
-```bash
-python main.py train --model small --dataset_preset multi30k-tiny \
-    --bias_preset b-gaussian --max_steps 4000 --log_dir runs --name small-egd-bgaussian
-# ... interrupted or stopped at update N ...
-python main.py train --model small --dataset_preset multi30k-tiny \
-    --bias_preset b-gaussian --max_steps 4000 --log_dir runs --name small-egd-bgaussian \
-    --resume runs/small-egd-bgaussian/model_final.pt
-```
+pick up from a checkpoint. Resume is a parameter like any other, so it is reached
+from the menu: **3)** → `a)` (all parameters) → find `--resume` and enter the
+checkpoint path, e.g. `runs/small-egd-bgaussian/model_final.pt`, then run 2).
+Keep the other settings identical to the original run.
 
 Both the model **and** the optimizer are restored, and EGD's own bookkeeping
 (iteration, `F0`, the rescaled `lr`/`nu`, the momentum norm and its RNG state)
 travels with it, so a resumed run continues the same trajectory rather than
-restarting the dynamics. Resuming into the same `--log_dir`/`--name` appends to
-the existing `training_log.csv` instead of truncating it. The flags you pass on
-the resume command must match the original run (different model shape or
-vocabulary means the checkpoint will not load).
+restarting the dynamics. Resuming into the same log directory and run name appends
+to the existing `training_log.csv` instead of truncating it. The settings must
+match the original run (a different model shape or vocabulary means the checkpoint
+will not load).
 
 ## Package Structure
 
 ```
   .
   ├── run.bat                     # Windows: double-click this
-  ├── run.py                      # the numbered menu behind run.bat
-  ├── my_config.py                # optional control panel (Chinese comments)
+  ├── run.py                      # the numbered menu behind run.bat: the ONLY entry point
+  ├── run_settings.json           # generated: what the menu remembers for you (gitignored)
   ├── 使用说明.md                  # plain-language Chinese guide
-  ├── main.py                     # scriptable entry point: train / evaluate / analyze-bias / report / plot
   ├── symbreak_transformer/
   │   ├── config.py               # Seq2SeqConfig + PRESETS, BiasConfig + BiasPresets, DataConfig
   │   ├── optimizer.py            # EGD (energy-conserving descent), AdamW/SGDM builders
@@ -351,10 +340,13 @@ vocabulary means the checkpoint will not load).
   │   ├── report.py               # every run -> one comparison figure + one Chinese table
   │   ├── plot_curve.py           # single-run training curve
   │   └── _common.py              # shared data flags / checkpoint loading for the scripts
-  ├── examples/                   # archived flag sets, one per experiment
   ├── tests/                      # pytest suite
   └── requirements.txt
 ```
+
+`scripts/` is internal: the menu spawns those scripts as subprocesses so that a
+crash in a training run returns to the menu instead of killing it. Nothing there
+is a documented way to use the project.
 
 ## Key Hyperparameter defaults, can be varied
 
@@ -478,31 +470,22 @@ The default task is `bentrevett/multi30k`, German → English image captions
 ### Large-scale corpus: FineWeb-Edu 10B
 
 `HuggingFaceFW/fineweb-edu`, config `sample/10BT` — roughly **10 B tokens in 14
-parquet shards (~28.5 GB)**. It is downloaded by a separate, **resumable** step,
-so an interrupted or closed download continues where it stopped instead of
-starting over:
-
-```bash
-python main.py download-data                 # fetch the shards (resumable)
-python main.py download-data --status        # how much is already on disk
-python main.py download-data --max_files 2   # just the first two shards (~4.3 GB)
-python main.py download-data --dest data/fineweb-edu/sample-10BT
-```
-
-`run.py` menu item **8** does the same thing in a **separate, visible console
-window**, so progress (or a stall) is observable rather than hidden behind the
-menu; the default destination is `data/fineweb-edu/sample-10BT`.
+parquet shards (~28.5 GB)**. Menu item **8)** fetches it through a separate,
+**resumable** downloader in a **separate, visible console window**, so progress
+(or a stall) is observable rather than hidden behind the menu; re-running it
+continues where it stopped instead of starting over, and it first reports how much
+is already on disk. The destination defaults to
+`data/fineweb-edu/sample-10BT`.
 
 FineWeb-Edu is **monolingual English**, so it cannot be used for translation. It
 is used with the span-corruption (T5-style denoising) objective instead, which
-needs no parallel data:
-
-```bash
-python main.py train --model small --dataset_preset fineweb-10b \
-    --objective denoising --fineweb_dir data/fineweb-edu/sample-10BT \
-    --bpe_vocab_size 32000 --tokenizer_train_documents 20000 \
-    --max_documents 0 --max_steps 2000
-```
+needs no parallel data. Select it from the menu: item **3)** → set
+`--dataset_preset` to `fineweb-quick` (a 20 000-document slice, for a first try)
+or `fineweb-10b` (everything), optionally adjust `--bpe_vocab_size`,
+`--tokenizer_train_documents`, `--max_documents` and bound the run with
+`--max_steps` — then run 1) or 2). Choosing a `fineweb-*` preset selects the
+denoising objective automatically, because that is the only objective the corpus
+supports.
 
 Under `--objective denoising` the encoder reads a document with a few spans
 replaced by `<extra_id_k>` sentinels and the decoder writes those spans back, so
@@ -524,13 +507,14 @@ indexed. Validation documents are held out deterministically by `--val_every`.
 python -m pytest tests -q
 ```
 
-230 tests, ~4 minutes on CPU. They cover the bias semantics (each mode,
+238 tests, ~3 minutes on CPU. They cover the bias semantics (each mode,
 resampling, learnable, per-sector independence), attention mask polarity and
 padding invariance, causality, weight tying, the EGD dynamics (`F0` floor,
 initialisation, checkpoint round trip), the tokenizer and collate contract,
 hand-computed BLEU values, the model-summary invariants (component rows sum to
 the distinct-parameter total, tied tensors reported once), the FineWeb/denoising
 path (BPE id layout, sentinel framing, span recovery, deterministic shuffling),
-a guard that every `scripts/train.py` option is reachable from `my_config.py`,
-and a full CLI end-to-end run — including a guard that every flag used in
-`examples/*.sh` exists in `scripts/train.py`.
+the menu itself (scripted input, graceful EOF, settings persistence, and a guard
+that **no second entry point exists**), a guard that every `scripts/train.py`
+option is reachable from the menu's parameter editor, and full end-to-end training
+runs through the same scripts the menu spawns.

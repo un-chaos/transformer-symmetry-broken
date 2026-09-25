@@ -854,19 +854,8 @@ def main() -> None:
         print(preset_table())
         model_parameter_counts(args.vocab)
         print()
-        print("example:")
-        print(
-            "  python main.py train --model small --bias_preset b-gaussian "
-            "--dataset_preset multi30k-tiny"
-        )
-        print(
-            "  python main.py train --model small --bias_preset b-const "
-            "--dataset_preset multi30k-tiny --bias_const 1.0"
-        )
-        print(
-            "  python main.py train --model smoke --dataset_preset synthetic-reverse "
-            "--max_steps 60"
-        )
+        print("这上面每一个设置都能在菜单 3) 里直接改；")
+        print("选好之后回菜单 1) 或 2) 就会用你的设置开始训练。")
         raise SystemExit(0)
 
     log_dir = namespace.get("log_dir", "runs")
@@ -1387,10 +1376,10 @@ def _dump_json(path: Path, payload: Dict[str, Any]) -> Path:
 def load_plot_curve():
     """Import ``scripts/plot_curve.py`` by path, wherever it is invoked from.
 
-    The script is run three ways -- ``python scripts/train.py`` (the script
-    directory is on ``sys.path``), ``python -m scripts.train`` and through
-    ``main.py``'s ``runpy`` dispatch (neither is) -- so the sibling module is
-    loaded from its file rather than by a plain ``import``.
+    The script is run two ways -- ``python scripts/train.py`` (the script
+    directory is on ``sys.path``) and as a subprocess spawned by ``run.py``'s menu
+    (it is not) -- so the sibling module is loaded from its file rather than by a
+    plain ``import``.
 
     Returns:
         The ``plot_curve`` callable, or ``None`` when the file cannot be loaded
