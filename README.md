@@ -507,7 +507,7 @@ indexed. Validation documents are held out deterministically by `--val_every`.
 python -m pytest tests -q
 ```
 
-238 tests, ~3 minutes on CPU. They cover the bias semantics (each mode,
+246 tests, ~3 minutes on CPU. They cover the bias semantics (each mode,
 resampling, learnable, per-sector independence), attention mask polarity and
 padding invariance, causality, weight tying, the EGD dynamics (`F0` floor,
 initialisation, checkpoint round trip), the tokenizer and collate contract,
